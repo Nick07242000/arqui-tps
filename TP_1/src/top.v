@@ -9,14 +9,14 @@ module top #(
     output wire [3:0]            led_aux
 );
 
-    // INPUT SIGNALS (ACTIVE LOW)
+    // INPUT SIGNALS
 
-    wire [DATA_WIDTH-1:0] sw_active_high = ~sw;
+    wire [DATA_WIDTH-1:0] sw_active_high = ~sw; // active low
     
-    wire rst   = ~btn[3]; // Global Reset
-    wire en_a  = ~btn[0]; // Enable for Register A
-    wire en_b  = ~btn[1]; // Enable for Register B
-    wire en_op = ~btn[2]; // Enable for Register OP
+    wire en_a  = ~btn[0]; // enable for register A
+    wire en_b  = ~btn[1]; // enable for register B
+    wire en_op = ~btn[2]; // enable for register OP
+    wire rst   = ~btn[3]; // global reset
 
     // INTERNAL WIRES (INTERCONNECTS)
 
