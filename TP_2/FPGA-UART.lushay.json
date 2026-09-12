@@ -1,0 +1,5 @@
+{
+  "name": "FPGA-UART",
+  "board": "tangnano20k",
+  "includedFiles": "all"
+}

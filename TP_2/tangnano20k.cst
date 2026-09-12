@@ -1,0 +1,105 @@
+// ==========================================================
+// STANDARD PROTOBOARD CONFIGURATION - TANG NANO 20K
+// ==========================================================
+
+// Clock (27 MHz)
+IO_LOC "clk" 4;
+IO_PORT "clk" PULL_MODE=NONE DRIVE=OFF;
+
+// ----------------------------------------------------------
+// Output: 2 Auxiliary LEDs (Active in HIGH)
+// ----------------------------------------------------------
+
+IO_LOC "led_aux[3]" 31;
+IO_PORT "led_aux[3]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led_aux[2]" 30;
+IO_PORT "led_aux[2]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led_aux[1]" 29;
+IO_PORT "led_aux[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led_aux[0]" 26;
+IO_PORT "led_aux[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// ----------------------------------------------------------
+// Output: 8 Main LEDs (MSB -> LSB, Active in HIGH)
+// ----------------------------------------------------------
+
+IO_LOC "led[7]" 25;
+IO_PORT "led[7]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[6]" 28;
+IO_PORT "led[6]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[5]" 27;
+IO_PORT "led[5]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[4]" 77;
+IO_PORT "led[4]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[3]" 85;
+IO_PORT "led[3]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[2]" 75;
+IO_PORT "led[2]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[1]" 74;
+IO_PORT "led[1]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+IO_LOC "led[0]" 73;
+IO_PORT "led[0]" IO_TYPE=LVCMOS33 DRIVE=8;
+
+// ----------------------------------------------------------
+// Inputs: 8 Switches to GND (internal PULL_UP: 0 = ON, 1 = OFF)
+// ----------------------------------------------------------
+
+IO_LOC "sw[7]" 72;
+IO_PORT "sw[7]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[6]" 86;
+IO_PORT "sw[6]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[5]" 49;
+IO_PORT "sw[5]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[4]" 55;
+IO_PORT "sw[4]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[3]" 48;
+IO_PORT "sw[3]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[2]" 51;
+IO_PORT "sw[2]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[1]" 54;
+IO_PORT "sw[1]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "sw[0]" 56;
+IO_PORT "sw[0]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// ----------------------------------------------------------
+// Inputs: 4 Buttons to GND (internal PULL_UP: 0 = pressed)
+// ----------------------------------------------------------
+
+IO_LOC "btn[0]" 41;
+IO_PORT "btn[0]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "btn[1]" 42;
+IO_PORT "btn[1]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "btn[2]" 80;
+IO_PORT "btn[2]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "btn[3]" 76;
+IO_PORT "btn[3]" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+// ----------------------------------------------------------
+// UART Communication (Connected to integrated USB debugger)
+// ----------------------------------------------------------
+
+IO_LOC "uart_tx" 69;
+IO_PORT "uart_tx" IO_TYPE=LVCMOS33 PULL_MODE=UP;
+
+IO_LOC "uart_rx" 70;
+IO_PORT "uart_rx" IO_TYPE=LVCMOS33 PULL_MODE=UP;
