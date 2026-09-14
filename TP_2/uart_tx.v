@@ -28,6 +28,15 @@ module uart_tx #(
     reg       tx_reg;
     reg       tx_next;
 
+    // initial values for registers
+    initial begin
+        state_reg = IDLE;
+        s_reg     = 0;
+        n_reg     = 0;
+        b_reg     = 0;
+        tx_reg    = 1'b1;
+    end
+
     always @(posedge clk) begin
         if (reset) begin
             state_reg <= IDLE;

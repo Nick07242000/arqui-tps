@@ -4,8 +4,8 @@ import serial
 import serial.tools.list_ports
 import threading
 
-
 # BACKEND: SERIAL PORT MANAGER
+
 class SerialManager:
     def __init__(self, on_receive_callback):
         self.serial_port = serial.Serial()
@@ -30,36 +30,45 @@ class SerialManager:
         if self.serial_port.is_open:
             self.serial_port.close()
 
-    def send_byte(self, byte_value):
+    def send_command(self, target_register, byte_value):
+        # sends exactly 2 bytes: target (0=A, 1=B, 2=OP) and value
         if self.serial_port.is_open:
             try:
-                self.serial_port.write(bytes([byte_value]))
+                self.serial_port.write(bytes([target_register, byte_value]))
             except Exception as e:
                 print(f"Error sending: {e}")
 
     def _listen(self):
+        # buffer to store the 5 bytes sent by the FPGA burst
+        rx_buffer = []
         while self.is_running and self.serial_port.is_open:
             try:
                 if self.serial_port.in_waiting > 0:
-                    data = self.serial_port.read(1)
-                    if data:
-                        # notify the GUI that data has arrived
-                        self.on_receive_callback(data[0])
+                    byte = self.serial_port.read(1)[0]
+                    rx_buffer.append(byte)
+                    
+                    # when all 5 frames arrive, update the UI
+                    if len(rx_buffer) == 5:
+                        self.on_receive_callback(list(rx_buffer))
+                        rx_buffer.clear()
             except:
                 break
 
-# FRONTEND: PRAPHICAL USER INTERFACE
+# FRONTEND: GRAPHICAL USER INTERFACE
+
 class ALUApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ALU Tang Nano 20K - Control Panel")
-        self.root.geometry("350x450")
+        self.root.title("ALU Tang Nano 20K - Command Center")
         self.root.resizable(False, False)
 
-        # state variables
-        self.rx_value = 0
+        # state variables for RX (A, B, OP, RES, STATUS)
+        self.rx_data = [0, 0, 0, 0, 0]
         self.base_var = tk.StringVar(value="DEC")
         
+        # target register selection: 0=A, 1=B, 2=OP
+        self.target_var = tk.IntVar(value=0)
+
         # opcode mapping
         self.opcodes = {
             "ADD": 32,
@@ -91,50 +100,76 @@ class ALUApp:
         self.btn_connect = ttk.Button(conn_frame, text="Connect", command=self.toggle_connection)
         self.btn_connect.pack(side=tk.LEFT)
 
-        # frame: displays (RX and TX)
-        disp_frame = ttk.Frame(self.root, padding=10)
-        disp_frame.pack(fill=tk.X)
+        # frame: FPGA status display (RX)
+        disp_frame = ttk.LabelFrame(self.root, text=" FPGA State (RX) ", padding=10)
+        disp_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Label(disp_frame, text="Received (RX):", font=("Arial", 9)).pack(anchor=tk.W)
-        self.lbl_rx = ttk.Label(disp_frame, text="0", font=("Consolas", 16, "bold"), background="#e0e0e0", anchor="e")
-        self.lbl_rx.pack(fill=tk.X, pady=(0, 10))
+        # dictionary to hold the RX labels
+        self.lbls_rx = {}
+        row = 0
+        for name in ["Reg A", "Reg B", "Reg OP", "ALU Result"]:
+            ttk.Label(disp_frame, text=f"{name}:", font=("Arial", 10, "bold")).grid(row=row, column=0, sticky=tk.W, pady=2)
+            lbl = ttk.Label(disp_frame, text="0", font=("Consolas", 12), width=15, anchor="e", background="#e0e0e0")
+            lbl.grid(row=row, column=1, sticky=tk.E, padx=10, pady=2)
+            self.lbls_rx[name] = lbl
+            row += 1
 
-        ttk.Label(disp_frame, text="To send (TX):", font=("Arial", 9)).pack(anchor=tk.W)
-        self.entry_tx = ttk.Entry(disp_frame, font=("Consolas", 16), justify="right")
-        self.entry_tx.pack(fill=tk.X)
-        self.entry_tx.bind('<Return>', lambda e: self.send_tx()) # Send on Enter key
+        # status bits indicators
+        stat_frame = ttk.Frame(disp_frame)
+        stat_frame.grid(row=row, column=0, columnspan=2, pady=10)
+        self.lbl_c = ttk.Label(stat_frame, text=" C: 0 ", background="gray", foreground="white", font=("Arial", 9, "bold"))
+        self.lbl_c.pack(side=tk.LEFT, padx=3)
+        self.lbl_z = ttk.Label(stat_frame, text=" Z: 0 ", background="gray", foreground="white", font=("Arial", 9, "bold"))
+        self.lbl_z.pack(side=tk.LEFT, padx=3)
+        self.lbl_o = ttk.Label(stat_frame, text=" O: 0 ", background="gray", foreground="white", font=("Arial", 9, "bold"))
+        self.lbl_o.pack(side=tk.LEFT, padx=3)
+        self.lbl_tx = ttk.Label(stat_frame, text=" TX_FULL: 0 ", background="gray", foreground="white", font=("Arial", 9, "bold"))
+        self.lbl_tx.pack(side=tk.LEFT, padx=3)
+
+        # frame: data entry (TX)
+        tx_frame = ttk.LabelFrame(self.root, text=" Send Data (TX) ", padding=10)
+        tx_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Radiobuttons for target register
+        tgt_frame = ttk.Frame(tx_frame)
+        tgt_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(tgt_frame, text="Target:").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(tgt_frame, text="Reg A", value=0, variable=self.target_var).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(tgt_frame, text="Reg B", value=1, variable=self.target_var).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(tgt_frame, text="Reg OP", value=2, variable=self.target_var).pack(side=tk.LEFT, padx=5)
+
+        self.entry_tx = ttk.Entry(tx_frame, font=("Consolas", 16), justify="right")
+        self.entry_tx.pack(fill=tk.X, pady=5)
+        self.entry_tx.bind('<Return>', lambda e: self.send_tx())
 
         # frame: base selector
-        base_frame = ttk.Frame(self.root, padding=5)
+        base_frame = ttk.Frame(tx_frame, padding=5)
         base_frame.pack(fill=tk.X)
         for base in ["DEC", "HEX", "BIN"]:
             ttk.Radiobutton(base_frame, text=base, value=base, variable=self.base_var, command=self.refresh_displays).pack(side=tk.LEFT, expand=True)
 
-        # frame: buttons (operations)
+        # frame: operation shortcuts
         btn_frame = ttk.Frame(self.root, padding=10)
         btn_frame.pack(fill=tk.BOTH, expand=True)
 
-        # configure 3 identical columns to distribute space evenly
         for i in range(3):
             btn_frame.columnconfigure(i, weight=1)
 
-        # organizes buttons in rows of 3 using sticky="ew" to stretch them
-        row_idx = 0
-        col_idx = 0
+        row_idx, col_idx = 0, 0
         for op, code in self.opcodes.items():
-            btn = ttk.Button(btn_frame, text=op, command=lambda c=code: self.sm.send_byte(c))
+            # send target 2 (OP Code) and the corresponding operation code
+            btn = ttk.Button(btn_frame, text=op, command=lambda c=code: self.sm.send_command(2, c))
             btn.grid(row=row_idx, column=col_idx, padx=3, pady=3, sticky="ew")
-            
             col_idx += 1
-            if col_idx > 2: # Move to the next row after the third column
+            if col_idx > 2:
                 col_idx = 0
                 row_idx += 1
         
-        # frame: send button
         btn_send = ttk.Button(self.root, text="SEND NUMBER", command=self.send_tx)
-        btn_send.pack(fill=tk.X, padx=10, pady=10)
+        btn_send.pack(fill=tk.X, padx=10, pady=5)
 
     # INTERFACE LOGIC
+
     def toggle_connection(self):
         if not self.sm.is_running:
             port = self.port_combo.get()
@@ -153,33 +188,48 @@ class ALUApp:
         if not txt: return
         
         try:
-            # parse text based on the selected base
             base = self.base_var.get()
             if base == "DEC":   val = int(txt, 10)
             elif base == "HEX": val = int(txt, 16)
             elif base == "BIN": val = int(txt, 2)
 
-            # limit to 8 bits (0-255)
             if 0 <= val <= 255:
-                self.sm.send_byte(val)
-                self.entry_tx.delete(0, tk.END) # Clear input
+                # sends target byte and value byte
+                target = self.target_var.get()
+                self.sm.send_command(target, val)
+                self.entry_tx.delete(0, tk.END)
             else:
                 messagebox.showwarning("Warning", "The value must be between 0 and 255.")
         except ValueError:
             messagebox.showerror("Error", f"Invalid number for base {base}.")
 
-    def update_rx_display(self, byte_val):
-        # since it arrives from a secondary thread, we use after() to safely update the UI
-        self.rx_value = byte_val
+    def update_rx_display(self, rx_buffer):
+        self.rx_data = rx_buffer
         self.root.after(0, self.refresh_displays)
 
     def refresh_displays(self):
         base = self.base_var.get()
-        if base == "DEC":   txt = str(self.rx_value)
-        elif base == "HEX": txt = f"0x{self.rx_value:02X}"
-        elif base == "BIN": txt = f"0b{self.rx_value:08b}"
+        names = ["Reg A", "Reg B", "Reg OP", "ALU Result"]
         
-        self.lbl_rx.config(text=txt)
+        # update data registers
+        for i in range(4):
+            val = self.rx_data[i]
+            if base == "DEC":   txt = str(val)
+            elif base == "HEX": txt = f"0x{val:02X}"
+            elif base == "BIN": txt = f"0b{val:08b}"
+            self.lbls_rx[names[i]].config(text=txt)
+            
+        # update status bits (Byte 4)
+        stat = self.rx_data[4]
+        carry = stat & 1
+        zero  = (stat >> 1) & 1
+        ovf   = (stat >> 2) & 1
+        tx    = (stat >> 3) & 1
+        
+        self.lbl_c.config(text=f" C: {carry} ", background="green" if carry else "gray")
+        self.lbl_z.config(text=f" Z: {zero} ", background="green" if zero else "gray")
+        self.lbl_o.config(text=f" O: {ovf} ", background="red" if ovf else "gray")
+        self.lbl_tx.config(text=f" TX_FULL: {tx} ", background="orange" if tx else "gray")
 
 if __name__ == "__main__":
     root = tk.Tk()

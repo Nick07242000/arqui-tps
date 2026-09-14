@@ -19,9 +19,16 @@ module uart_top (
     wire [7:0] rx_data_out;
 
     // interface registers
-    reg [7:0] r_data_reg   = 8'b0;
-    reg       rx_empty_reg = 1'b1;
-    reg       tx_full_reg  = 1'b0;
+    reg [7:0] r_data_reg;
+    reg       rx_empty_reg;
+    reg       tx_full_reg;
+
+    // initial values for registers
+    initial begin
+        r_data_reg   = 8'b0;
+        rx_empty_reg = 1'b1;
+        tx_full_reg  = 1'b0;
+    end
 
     // baud rate generator instantiation
     baud_rate_generator baud_gen_unit (
