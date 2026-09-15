@@ -29,12 +29,6 @@ module uart_interface #(
     reg                 rx_empty_reg;  // Indicates whether the receive register contains unread data.
     reg                 tx_busy_reg;   // Indicates whether the transmitter is currently busy.
 
-    // Inital values
-    initial begin
-        read_data_reg = 8'b0;
-        rx_empty_reg  = 1'b1;
-        tx_busy_reg   = 1'b0;
-    end
 
     // Baud rate generator
     baud_rate_generator #(
