@@ -1,13 +1,14 @@
 module alu #(
-    parameter DATA_WIDTH = 8
+    parameter integer DATA_WIDTH = 8
 )(
-    input  wire [DATA_WIDTH-1:0] a,
-    input  wire [DATA_WIDTH-1:0] b,
-    input  wire [5:0]            alu_op,
-    output reg  [DATA_WIDTH-1:0] result,
-    output wire                  zero,
-    output reg                   carry,
-    output reg                   overflow
+    input  wire [DATA_WIDTH-1:0] i_a,
+    input  wire [DATA_WIDTH-1:0] i_b,
+    input  wire [5:0]            i_alu_op,
+
+    output reg  [DATA_WIDTH-1:0] o_result,
+    output wire                  o_zero,
+    output reg                   o_carry,
+    output reg                   o_overflow
 );
 
     localparam OP_ADD = 6'b100000;
@@ -19,39 +20,56 @@ module alu #(
     localparam OP_SRL = 6'b000010;
     localparam OP_SRA = 6'b000011;
 
-    localparam SHIFT_WIDTH = (DATA_WIDTH <= 2) ? 1 : $clog2(DATA_WIDTH);
+    // Number of bits needed to represent a shift amount.
+    localparam SHIFT_WIDTH =
+        (DATA_WIDTH <= 2) ? 1 : $clog2(DATA_WIDTH);
 
+    // One extra bit for carry output.
     reg [DATA_WIDTH:0] ext_result;
 
     always @(*) begin
-        ext_result = {(DATA_WIDTH+1){1'b0}};
-        overflow   = 1'b0;
+        ext_result = 0;
+        o_overflow = 0;
 
-        case (alu_op)
+        case (i_alu_op)
+
             OP_ADD: begin
-                ext_result = a + b;
-                overflow = (a[DATA_WIDTH-1] == b[DATA_WIDTH-1]) && (ext_result[DATA_WIDTH-1] != a[DATA_WIDTH-1]);
+                ext_result = i_a + i_b;
+                o_overflow =
+                    (i_a[DATA_WIDTH-1] == i_b[DATA_WIDTH-1]) &&
+                    (ext_result[DATA_WIDTH-1] != i_a[DATA_WIDTH-1]);
             end
-            
+
             OP_SUB: begin
-                ext_result = a - b;
-                overflow = (a[DATA_WIDTH-1] != b[DATA_WIDTH-1]) && (ext_result[DATA_WIDTH-1] != a[DATA_WIDTH-1]);
+                ext_result = i_a - i_b;
+                o_overflow =
+                    (i_a[DATA_WIDTH-1] != i_b[DATA_WIDTH-1]) &&
+                    (ext_result[DATA_WIDTH-1] != i_a[DATA_WIDTH-1]);
             end
-            
-            OP_AND:  ext_result = {1'b0, a & b};
-            OP_OR:   ext_result = {1'b0, a | b};
-            OP_XOR:  ext_result = {1'b0, a ^ b};
-            OP_NOR:  ext_result = {1'b0, ~(a | b)};
-            OP_SRL:  ext_result = {1'b0, a >> b[SHIFT_WIDTH-1:0]};
-            OP_SRA:  ext_result = {1'b0, $signed(a) >>> b[SHIFT_WIDTH-1:0]};
-            
-            default: ext_result = {(DATA_WIDTH+1){1'b0}};
+
+            OP_AND: ext_result = {1'b0, i_a & i_b};
+
+            OP_OR: ext_result = {1'b0, i_a | i_b};
+
+            OP_XOR: ext_result = {1'b0, i_a ^ i_b};
+
+            OP_NOR: ext_result = {1'b0, ~(i_a | i_b)};
+
+            OP_SRL: ext_result = {1'b0, i_a >> i_b[SHIFT_WIDTH-1:0]};
+
+            OP_SRA: ext_result = {1'b0, $signed(i_a) >>> i_b[SHIFT_WIDTH-1:0]};
+
+            default: ; // Keep default values.
         endcase
 
-        result = ext_result[DATA_WIDTH-1:0];
-        carry  = ext_result[DATA_WIDTH];
+        // The lower DATA_WIDTH bits are the actual ALU result.
+        o_result = ext_result[DATA_WIDTH-1:0];
+
+        // The extra bit contains the carry from arithmetic operations.
+        o_carry = ext_result[DATA_WIDTH];
     end
 
-    assign zero = (result == {DATA_WIDTH{1'b0}}) ? 1'b1 : 1'b0;
+    // High when the ALU result is zero.
+    assign o_zero = (o_result == 0);
 
 endmodule

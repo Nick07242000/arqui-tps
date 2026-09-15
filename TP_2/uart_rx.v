@@ -1,103 +1,166 @@
 module uart_rx #(
-    parameter DBIT = 8,    // data bits
-    parameter SB_TICK = 16 // ticks for stop bit
+    parameter integer DATA_BITS       = 8,
+    parameter integer OVERSAMPLE_RATE = 16,
+    parameter integer STOP_BIT_TICKS  = 16
 )(
-    input  wire       clk,
-    input  wire       reset,
-    input  wire       rx,
-    input  wire       s_tick,
-    output reg        rx_done_tick,
-    output wire [7:0] dout
+    input  wire                  i_clk,
+    input  wire                  i_reset,
+    input  wire                  i_rx,
+    input  wire                  i_baud_tick,
+
+    output reg                   o_rx_done,
+    output wire [DATA_BITS-1:0]  o_data_out
 );
 
+// Receiver states
     localparam [1:0]
-        IDLE  = 2'b00,
-        START = 2'b01,
-        DATA  = 2'b10,
-        STOP  = 2'b11;
+        STATE_IDLE  = 2'b00,
+        STATE_START = 2'b01,
+        STATE_DATA  = 2'b10,
+        STATE_STOP  = 2'b11;
 
-    reg [1:0] state_reg;
-    reg [1:0] state_next;
-    reg [3:0] s_reg;
-    reg [3:0] s_next;
-    reg [2:0] n_reg;
-    reg [2:0] n_next; 
-    reg [7:0] b_reg;
-    reg [7:0] b_next; 
+// Counter sizes
+    // Number of ticks needed to reach the middle of a bit.
+    localparam integer HALF_BIT_TICKS = OVERSAMPLE_RATE / 2;
 
-    // initial values for registers
+    // Width needed for the tick counter.
+    localparam integer TICK_COUNT_WIDTH =
+        (OVERSAMPLE_RATE <= 1) ? 1 : $clog2(OVERSAMPLE_RATE);
+
+    // Width needed for the data-bit counter.
+    localparam integer BIT_INDEX_WIDTH =
+        (DATA_BITS <= 1) ? 1 : $clog2(DATA_BITS);
+
+// Receiver registers
+    reg [1:0]                    state;
+
+    reg [TICK_COUNT_WIDTH-1:0]   tick_count;
+    // Counts baud ticks within the current UART bit.
+
+    reg [BIT_INDEX_WIDTH-1:0]    bit_index;
+    // Keeps track of which data bit is being received.
+
+    reg [DATA_BITS-1:0]          data_reg;
+    // Stores the received byte.
+
+// Initial values
     initial begin
-        state_reg = IDLE;
-        s_reg     = 0;
-        n_reg     = 0;
-        b_reg     = 0;
+        state      = STATE_IDLE;
+        tick_count = 0;
+        bit_index  = 0;
+        data_reg   = 0;
     end
 
-    // state and data registers
-    always @(posedge clk) begin
-        if (reset) begin
-            state_reg <= IDLE;
-            s_reg     <= 0;
-            n_reg     <= 0;
-            b_reg     <= 0;
+
+// State handlers
+
+    // Wait for RX to go low, indicating the beginning of
+    // a new UART frame.
+    task handle_idle;
+        begin
+            if (!i_rx) begin
+                state      <= STATE_START;
+                tick_count <= 0;
+            end
+        end
+    endtask
+
+
+    // Wait half of a UART bit so that the first data bit
+    // can be sampled near the center of its bit period.
+    task handle_start;
+        begin
+            if (i_baud_tick) begin
+                if (tick_count == HALF_BIT_TICKS - 1) begin
+
+                    // Start bit is confirmed.
+                    state      <= STATE_DATA;
+                    tick_count <= 0;
+                    bit_index  <= 0;
+
+                end else begin
+                    tick_count <= tick_count + 1'b1;
+                end
+            end
+        end
+    endtask
+
+
+    // Wait one complete UART bit and sample the next data bit.
+    // UART sends data least significant bit first.
+    task handle_data;
+        begin
+            if (i_baud_tick) begin
+                if (tick_count == OVERSAMPLE_RATE - 1) begin
+
+                    tick_count <= 0;
+
+                    // Shift the received bit into the data register.
+                    data_reg <= {i_rx, data_reg[DATA_BITS-1:1]};
+
+                    // Check whether this was the last data bit.
+                    if (bit_index == DATA_BITS - 1) begin
+                        state <= STATE_STOP;
+                    end else begin
+                        bit_index <= bit_index + 1'b1;
+                    end
+
+                end else begin
+                    tick_count <= tick_count + 1'b1;
+                end
+            end
+        end
+    endtask
+
+
+    // Wait through the stop bit. Once the stop bit is complete,
+    // signal that a complete byte has been received.
+    task handle_stop;
+        begin
+            if (i_baud_tick) begin
+                if (tick_count == STOP_BIT_TICKS - 1) begin
+
+                    state    <= STATE_IDLE;
+                    o_rx_done <= 1'b1;
+
+                end else begin
+                    tick_count <= tick_count + 1'b1;
+                end
+            end
+        end
+    endtask
+
+
+ // UART receiver
+    always @(posedge i_clk) begin
+
+        if (i_reset) begin
+
+            state       <= STATE_IDLE;
+            tick_count  <= 0;
+            bit_index   <= 0;
+            data_reg    <= 0;
+            o_rx_done   <= 1'b0;
+
         end else begin
-            state_reg <= state_next;
-            s_reg     <= s_next;
-            n_reg     <= n_next;
-            b_reg     <= b_next;
+
+            // rx_done is normally low.
+            // It is set high for one clock cycle when a byte is ready.
+            o_rx_done <= 1'b0;
+
+            case (state)
+
+                STATE_IDLE:  handle_idle();
+                STATE_START: handle_start();
+                STATE_DATA:  handle_data();
+                STATE_STOP:  handle_stop();
+                default: state <= STATE_IDLE;
+
+            endcase
         end
     end
 
-    // next-state logic and data path
-    always @* begin
-        state_next   = state_reg;
-        rx_done_tick = 1'b0;
-        s_next       = s_reg;
-        n_next       = n_reg;
-        b_next       = b_reg;
-
-        case (state_reg)
-            IDLE:
-                if (~rx) begin
-                    state_next = START;
-                    s_next     = 0;
-                end
-            START:
-                if (s_tick) begin
-                    if (s_reg == 7) begin
-                        state_next = DATA;
-                        s_next     = 0;
-                        n_next     = 0;
-                    end else begin
-                        s_next = s_reg + 1;
-                    end
-                end
-            DATA:
-                if (s_tick) begin
-                    if (s_reg == 15) begin
-                        s_next = 0;
-                        b_next = {rx, b_reg[7:1]};
-                        if (n_reg == (DBIT - 1)) begin
-                            state_next = STOP;
-                        end else begin
-                            n_next = n_reg + 1;
-                        end
-                    end else begin
-                        s_next = s_reg + 1;
-                    end
-                end
-            STOP:
-                if (s_tick) begin
-                    if (s_reg == (SB_TICK - 1)) begin
-                        state_next   = IDLE;
-                        rx_done_tick = 1'b1;
-                    end else begin
-                        s_next = s_reg + 1;
-                    end
-                end
-        endcase
-    end
-
-    assign dout = b_reg;
+    // Connect the internal data register to the module output.
+    assign o_data_out = data_reg;
 
 endmodule

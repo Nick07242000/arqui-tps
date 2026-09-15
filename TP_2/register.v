@@ -1,18 +1,24 @@
 module register #(
-    parameter WIDTH = 8
+    parameter integer WIDTH = 8
 )(
-    input  wire             clk,
-    input  wire             rst, // active HIGH reset
-    input  wire             en,  // active HIGH enable
-    input  wire [WIDTH-1:0] d,   // data input
-    output reg  [WIDTH-1:0] q    // data output
+    input  wire             i_clk,
+    input  wire             i_reset,
+    input  wire             i_enable,
+    input  wire [WIDTH-1:0] i_data,
+
+    output reg  [WIDTH-1:0] o_data
 );
 
-    always @(posedge clk) begin
-        if (rst) begin
-            q <= {WIDTH{1'b0}};  // clear all bits on reset
-        end else if (en) begin
-            q <= d;              // load data on enable
+    always @(posedge i_clk) begin
+
+        // Reset has priority over the enable signal.
+        if (i_reset) begin
+            o_data <= {WIDTH{1'b0}};
+        end
+
+        // Load new data when the register is enabled.
+        else if (i_enable) begin
+            o_data <= i_data;
         end
     end
 
