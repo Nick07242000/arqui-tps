@@ -89,7 +89,7 @@ module top #(
     // ========================================================
     controller controller_inst (
         .i_clk        (clk),
-        .i_           (system_reset),
+        .i_reset      (system_reset),
 
         .i_rx_empty   (uart_rx_empty),
         .i_rx_data    (uart_rx_data),
