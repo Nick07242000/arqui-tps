@@ -42,13 +42,6 @@ module controller (
     reg [2:0] tx_select;
     reg [2:0] next_tx_select;
 
-    
-    // Initial values
-    initial begin
-        state      = STATE_IDLE;
-        command    = 8'd0;
-        tx_select  = 3'd0;
-    end
 
     // State registers
     always @(posedge i_clk) begin
