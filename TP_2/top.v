@@ -104,18 +104,14 @@ module top #(
     ) uart_interface_inst (
         .i_clk        (clk),
         .i_reset      (reset),
-
         .i_rx         (uart_rx),
         .i_rd_uart    (uart_rx_read),
-
         .i_wr_uart    (uart_tx_start),
         .i_write_data (uart_tx_data),
-
         .o_tx         (uart_tx),
-
-        .o_read_data  (uart_rx_data),
         .o_rx_empty   (uart_rx_empty),
-        .o_tx_full    (uart_tx_full)
+        .o_tx_busy    (uart_tx_full),
+        .o_read_data  (uart_rx_data)
     );
 
 

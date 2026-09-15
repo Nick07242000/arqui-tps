@@ -15,10 +15,10 @@ module uart_tx #(
 
 // Transmitter states
     localparam [1:0]
-        IDLE  = 2'b00,
-        START = 2'b01,
-        DATA  = 2'b10,
-        STOP  = 2'b11;
+        STATE_IDLE  = 2'b00,
+        STATE_START = 2'b01,
+        STATE_DATA  = 2'b10,
+        STATE_STOP  = 2'b11;
 
 // Counter sizes
 
@@ -66,7 +66,7 @@ module uart_tx #(
             tx_reg <= 1'b1;
 
             if (i_tx_start) begin
-                state      <= START;
+                state      <= STATE_START;
                 tick_count <= 0;
                 data_reg   <= i_data_in;
             end
@@ -82,7 +82,7 @@ module uart_tx #(
 
             if (i_baud_tick) begin
                 if (tick_count == OVERSAMPLE_RATE - 1) begin
-                    state      <= DATA;
+                    state      <= STATE_DATA;
                     tick_count <= 0;
                     bit_index  <= 0;
                 end
@@ -108,7 +108,7 @@ module uart_tx #(
 
                     // Check whether this was the last data bit.
                     if (bit_index == DATA_BITS - 1) begin
-                        state <= STOP;
+                        state <= STATE_STOP;
                     end
                     else begin
                         bit_index <= bit_index + 1'b1;
@@ -131,7 +131,7 @@ module uart_tx #(
 
             if (i_baud_tick) begin
                 if (tick_count == STOP_BIT_TICKS - 1) begin
-                    state     <= IDLE;
+                    state     <= STATE_IDLE;
                     o_tx_done <= 1'b1;
                 end
                 else begin
@@ -146,7 +146,7 @@ module uart_tx #(
     always @(posedge i_clk) begin
 
         if (i_reset) begin
-            state      <= IDLE;
+            state      <= STATE_IDLE;
             tick_count <= 0;
             bit_index  <= 0;
             data_reg   <= 0;
@@ -162,11 +162,11 @@ module uart_tx #(
 
             case (state)
 
-                IDLE: handle_idle();
-                START: handle_start();
-                DATA: handle_data();
-                STOP: handle_stop();
-                default: state <= IDLE;
+                STATE_IDLE:  handle_idle();
+                STATE_START: handle_start();
+                STATE_DATA:  handle_data();
+                STATE_STOP:  handle_stop();
+                default: state <= STATE_IDLE;
 
             endcase
         end
