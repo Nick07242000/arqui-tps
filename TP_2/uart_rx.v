@@ -43,14 +43,6 @@ module uart_rx #(
     reg [DATA_BITS-1:0]          data_reg;
     // Stores the received byte.
 
-// Initial values
-    initial begin
-        state      = STATE_IDLE;
-        tick_count = 0;
-        bit_index  = 0;
-        data_reg   = 0;
-    end
-
 
 // State handlers
 
