@@ -1,7 +1,3 @@
-// UART Receiver
-// 8N1 format, LSB first.
-// Uses the main FPGA clock and a baud-rate tick for UART timing.
-
 module uart_rx #(
     parameter integer DATA_BITS       = 8,
     parameter integer OVERSAMPLE_RATE = 16,
@@ -16,20 +12,14 @@ module uart_rx #(
     output wire [DATA_BITS-1:0]  o_data_out
 );
 
-    //============================================================
-    // Receiver states
-    //============================================================
+// Receiver states
     localparam [1:0]
         IDLE  = 2'b00,
         START = 2'b01,
         DATA  = 2'b10,
         STOP  = 2'b11;
 
-
-    //============================================================
-    // Counter sizes
-    //============================================================
-
+// Counter sizes
     // Number of ticks needed to reach the middle of a bit.
     localparam integer HALF_BIT_TICKS = OVERSAMPLE_RATE / 2;
 
@@ -41,11 +31,7 @@ module uart_rx #(
     localparam integer BIT_INDEX_WIDTH =
         (DATA_BITS <= 1) ? 1 : $clog2(DATA_BITS);
 
-
-    //============================================================
-    // Receiver registers
-    //============================================================
-
+// Receiver registers
     reg [1:0]                    state;
 
     reg [TICK_COUNT_WIDTH-1:0]   tick_count;
@@ -57,10 +43,16 @@ module uart_rx #(
     reg [DATA_BITS-1:0]          data_reg;
     // Stores the received byte.
 
+// Initial values
+    initial begin
+        state      = STATE_IDLE;
+        tick_count = 0;
+        bit_index  = 0;
+        data_reg   = 0;
+    end
 
-    //============================================================
-    // State handlers
-    //============================================================
+
+// State handlers
 
     // Wait for RX to go low, indicating the beginning of
     // a new UART frame.
@@ -139,10 +131,7 @@ module uart_rx #(
     endtask
 
 
-    //============================================================
-    // UART receiver
-    //============================================================
-
+ // UART receiver
     always @(posedge i_clk) begin
 
         if (i_reset) begin
@@ -170,7 +159,6 @@ module uart_rx #(
             endcase
         end
     end
-
 
     // Connect the internal data register to the module output.
     assign o_data_out = data_reg;

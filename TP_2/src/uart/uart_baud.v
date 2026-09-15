@@ -1,8 +1,3 @@
-// UART Baud Rate Generator 
-// Generates a clock-enable pulse at 16x the UART baud rate. 
-// The main FPGA clock (i_clk) is used everywhere; 
-// o_tick simply tells the UART when to perform an operation.
-
 module baud_rate_generator #(
     parameter integer CLK_FREQ = 27000000,
     parameter integer BAUD_RATE  = 9600,

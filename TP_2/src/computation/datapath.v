@@ -1,15 +1,3 @@
-// ALU Datapath
-//
-// Stores the ALU operands and operation code, and performs the
-// selected ALU operation.
-//
-// Data can be loaded either:
-//   - manually through the switches, or
-//   - automatically through the UART controller.
-//
-// The controller only provides register-enable signals.
-// This module handles the actual data storage and computation.
-
 module datapath #(
     parameter integer DATA_WIDTH = 8,
     parameter integer OP_WIDTH   = 6
@@ -17,16 +5,14 @@ module datapath #(
     input  wire                  i_clk,
     input  wire                  i_reset,
 
-    // Manual inputs
+    // Manual controls
     input  wire [DATA_WIDTH-1:0] i_switch_data,
     input  wire                  i_enable_a_manual,
     input  wire                  i_enable_b_manual,
     input  wire                  i_enable_op_manual,
 
-    // UART/controller input
+    // UART/controller controls
     input  wire [DATA_WIDTH-1:0] i_uart_data,
-
-    // Controller register enables
     input  wire                  i_enable_a,
     input  wire                  i_enable_b,
     input  wire                  i_enable_op,
@@ -43,12 +29,7 @@ module datapath #(
     output wire                  o_overflow
 );
 
-    //============================================================
-    // Register inputs
-    //============================================================
-
-    // Manual controls take priority when their corresponding
-    // button is pressed. Otherwise UART data is used.
+    // Select data and enable source for each register.
     wire [DATA_WIDTH-1:0] reg_a_data =
         i_enable_a_manual ? i_switch_data : i_uart_data;
 
@@ -60,20 +41,11 @@ module datapath #(
             ? i_switch_data[OP_WIDTH-1:0]
             : i_uart_data[OP_WIDTH-1:0];
 
-    // A register can be enabled manually or by the controller.
-    wire reg_a_enable =
-        i_enable_a_manual || i_enable_a;
+    wire reg_a_enable  = i_enable_a_manual  || i_enable_a;
+    wire reg_b_enable  = i_enable_b_manual  || i_enable_b;
+    wire reg_op_enable = i_enable_op_manual || i_enable_op;
 
-    wire reg_b_enable =
-        i_enable_b_manual || i_enable_b;
-
-    wire reg_op_enable =
-        i_enable_op_manual || i_enable_op;
-
-    //============================================================
     // Registers
-    //============================================================
-
     register #(
         .WIDTH(DATA_WIDTH)
     ) reg_a_inst (
@@ -104,10 +76,7 @@ module datapath #(
         .o_data   (o_op)
     );
 
-    //============================================================
     // ALU
-    //============================================================
-
     alu #(
         .DATA_WIDTH(DATA_WIDTH)
     ) alu_inst (
@@ -116,8 +85,8 @@ module datapath #(
         .i_alu_op   (o_op),
         .o_result   (o_result),
         .o_zero     (o_zero),
-        .o_carry    (o_carry),
-        .o_overflow (o_overflow)
+        .o_carry     (o_carry),
+        .o_overflow  (o_overflow)
     );
 
 endmodule

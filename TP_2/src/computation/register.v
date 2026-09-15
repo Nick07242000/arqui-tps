@@ -1,9 +1,3 @@
- // Parameterized Register
- //
- // Stores a WIDTH-bit value on the rising edge of the clock.
- // The register can be cleared using the reset input or loaded
- // with new data when the enable input is active.
-
 module register #(
     parameter integer WIDTH = 8
 )(

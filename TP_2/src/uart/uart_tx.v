@@ -1,7 +1,3 @@
-// UART Transmitter
-// 8N1 format, LSB first.
-// Uses the main FPGA clock and a baud-rate tick for UART timing.
-
 module uart_tx #(
     parameter integer DATA_BITS       = 8,
     parameter integer OVERSAMPLE_RATE = 16,
@@ -17,20 +13,14 @@ module uart_tx #(
     output wire                  o_tx
 );
 
-    //============================================================
-    // Transmitter states
-    //============================================================
-
+// Transmitter states
     localparam [1:0]
         IDLE  = 2'b00,
         START = 2'b01,
         DATA  = 2'b10,
         STOP  = 2'b11;
 
-
-    //============================================================
-    // Counter sizes
-    //============================================================
+// Counter sizes
 
     // Width needed for the tick counter.
     localparam integer TICK_COUNT_WIDTH =
@@ -41,10 +31,7 @@ module uart_tx #(
         (DATA_BITS <= 1) ? 1 : $clog2(DATA_BITS);
 
 
-    //============================================================
-    // Transmitter registers
-    //============================================================
-
+// Transmitter registers
     reg [1:0]                   state;
 
     reg [TICK_COUNT_WIDTH-1:0]  tick_count;
@@ -60,9 +47,16 @@ module uart_tx #(
     // Stores the current UART output level.
 
 
-    //============================================================
-    // State handlers
-    //============================================================
+// Initial values
+    initial begin
+        state      = STATE_IDLE;
+        tick_count = 0;
+        bit_index  = 0;
+        data_reg   = 0;
+        tx_reg     = 1'b1;
+    end
+
+// State handlers
 
     // Keep TX high while idle.
     // When a transmission is requested, store the input data
@@ -148,10 +142,7 @@ module uart_tx #(
     endtask
 
 
-    //============================================================
-    // UART transmitter
-    //============================================================
-
+// UART transmitter
     always @(posedge i_clk) begin
 
         if (i_reset) begin
