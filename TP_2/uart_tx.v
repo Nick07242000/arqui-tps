@@ -46,16 +46,6 @@ module uart_tx #(
     reg                         tx_reg;
     // Stores the current UART output level.
 
-
-// Initial values
-    initial begin
-        state      = STATE_IDLE;
-        tick_count = 0;
-        bit_index  = 0;
-        data_reg   = 0;
-        tx_reg     = 1'b1;
-    end
-
 // State handlers
 
     // Keep TX high while idle.

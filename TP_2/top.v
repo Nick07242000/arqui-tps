@@ -48,6 +48,20 @@ module top #(
     wire alu_carry;
     wire alu_overflow;
 
+    
+    // ========================================================
+    // POWER ON RESET
+    // 16-cycle active-high power-on reset generator
+    // ========================================================
+    reg [3:0] por_shift = 4'b0;
+    wire por_reset = !por_shift[3];
+    
+    always @(posedge clk) begin
+        por_shift <= {por_shift[2:0], 1'b1};
+    end
+    
+    wire system_reset = reset || por_reset;
+
 
     // ========================================================
     // UART RESPONSE DATA MUX
@@ -75,7 +89,7 @@ module top #(
     // ========================================================
     controller controller_inst (
         .i_clk        (clk),
-        .i_reset      (reset),
+        .i_reset      (system_reset),
 
         .i_rx_empty   (uart_rx_empty),
         .i_rx_data    (uart_rx_data),
@@ -103,7 +117,7 @@ module top #(
         .OVERSAMPLE_RATE (16)
     ) uart_interface_inst (
         .i_clk        (clk),
-        .i_reset      (reset),
+        .i_reset      (system_reset),
         .i_rx         (uart_rx),
         .i_rd_uart    (uart_rx_read),
         .i_wr_uart    (uart_tx_start),
@@ -124,7 +138,7 @@ module top #(
         .OP_WIDTH  (OP_WIDTH)
     ) datapath_inst (
         .i_clk   (clk),
-        .i_reset (reset),
+        .i_reset (system_reset),
 
         // Manual inputs
         .i_switch_data       (switch_data),
