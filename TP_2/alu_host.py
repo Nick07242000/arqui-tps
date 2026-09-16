@@ -76,6 +76,7 @@ class ALUApp:
             "AND": 36,
             "OR":  37,
             "XOR": 38,
+            "NOR": 39,
             "SRL": 2,
             "SRA": 3
         }
