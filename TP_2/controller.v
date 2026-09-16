@@ -22,14 +22,14 @@ module controller (
 
     // FSM states
     localparam [3:0]
-        STATE_IDLE          = 4'd0,
-        STATE_WAIT_CMD_ACK  = 4'd1,
-        STATE_WAIT_VALUE    = 4'd2,
-        STATE_WAIT_VAL_ACK  = 4'd3,
-        STATE_WAIT_TX_READY = 4'd4,
-        STATE_START_TX      = 4'd5,
-        STATE_TX_DELAY      = 4'd6,
-        STATE_WAIT_TX_DONE  = 4'd7;
+        STATE_IDLE          = 4'd0, // Do nothing.
+        STATE_WAIT_CMD_ACK  = 4'd1, // Wait until the command byte has been removed from the RX buffer.
+        STATE_WAIT_VALUE    = 4'd2, // Wait for the value associated with the command.
+        STATE_WAIT_VAL_ACK  = 4'd3, // Wait until the value byte has been removed from the RX buffer.
+        STATE_WAIT_TX_READY = 4'd4, // Wait until the transmitter is ready for the next response byte.
+        STATE_START_TX      = 4'd5, // Start transmission of the selected response byte.
+        STATE_TX_DELAY      = 4'd6, // Give the transmitter one cycle to update its busy status.
+        STATE_WAIT_TX_DONE  = 4'd7; // Wait for the current response byte to finish transmitting.
 
     reg [3:0] state;
     reg [3:0] next_state;
