@@ -15,7 +15,7 @@ module uart_interface #(
     output wire                    o_tx,        // UART physical output
     output wire                    o_rx_empty,  // High when there is no unread received byte.
     output wire                    o_tx_busy,   // High while the transmitter is busy.
-    output wire [DATA_BITS-1:0]    o_read_data, // Most recently received data.
+    output wire [DATA_BITS-1:0]    o_read_data  // Most recently received data.
 );
 
     // Internal UART signals

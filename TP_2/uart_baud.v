@@ -1,17 +1,17 @@
 module baud_rate_generator #(
-    parameter integer CLK_FREQ = 27000000,
-    parameter integer BAUD_RATE  = 9600,
-    parameter integer OVERSAMPLE_RATE = 16
+    parameter CLK_FREQ = 27000000,
+    parameter BAUD_RATE  = 9600,
+    parameter OVERSAMPLE_RATE = 16
 )(
     input  wire i_clk,
     input  wire i_reset,
     output wire o_tick
 );
     // Number of FPGA clock cycles between UART ticks.
-    localparam integer TICK_COUNT = CLK_FREQ / (BAUD_RATE * OVERSAMPLE_RATE);
+    localparam TICK_COUNT = CLK_FREQ / (BAUD_RATE * OVERSAMPLE_RATE);
 
     // Automatically calculate the number of bits needed by the counter. 
-    localparam integer COUNTER_WIDTH = (TICK_COUNT <= 1) ? 1 : $clog2(TICK_COUNT);
+    localparam COUNTER_WIDTH = (TICK_COUNT <= 1) ? 1 : $clog2(TICK_COUNT);
     
     // Counter 
     reg [COUNTER_WIDTH-1:0] counter;

@@ -37,9 +37,7 @@ module datapath #(
         i_enable_b_manual ? i_switch_data : i_uart_data;
 
     wire [OP_WIDTH-1:0] reg_op_data =
-        i_enable_op_manual
-            ? i_switch_data[OP_WIDTH-1:0]
-            : i_uart_data[OP_WIDTH-1:0];
+        i_enable_op_manual ? i_switch_data[OP_WIDTH-1:0] : i_uart_data[OP_WIDTH-1:0];
 
     wire reg_a_enable  = i_enable_a_manual  || i_enable_a;
     wire reg_b_enable  = i_enable_b_manual  || i_enable_b;
