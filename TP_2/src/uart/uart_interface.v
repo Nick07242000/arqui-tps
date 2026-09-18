@@ -61,7 +61,7 @@ module uart_interface #(
     ) tx_unit (
         .i_clk       (i_clk),
         .i_reset     (i_reset),
-        .i_tx_start  (i_wr_uart && !tx_busy_reg),
+        .i_tx_start  (i_wr_uart && (!tx_busy_reg || tx_done)),
         .i_baud_tick (baud_tick),
         .i_data_in   (i_write_data),
         .o_tx_done   (tx_done),
@@ -98,7 +98,7 @@ module uart_interface #(
             // Transmit interface
             //----------------------------------------------------
             // The system requested a transmission and the transmitter was available.
-            if (i_wr_uart && !tx_busy_reg) begin
+            if (i_wr_uart && (!tx_busy_reg || tx_done)) begin
                 tx_busy_reg <= 1'b1; // Mark the transmitter as busy.
             end
             // The complete byte has finished transmitting.

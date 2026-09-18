@@ -61,11 +61,9 @@ module tb_controller;
     // a couple of cycles like a real transmission in progress.
     task emulate_tx;
         begin
-            while (!o_tx_start) @(posedge i_clk);
-            @(posedge i_clk);        // move into STATE_TX_DELAY
-            i_tx_full = 1'b1;        // simulate the transmitter going busy
+            #1 i_tx_full = 1'b1;        // simulate the transmitter going busy
             repeat (2) @(posedge i_clk);
-            i_tx_full = 1'b0;        // simulate the transmitter finishing
+            #1 i_tx_full = 1'b0;        // simulate the transmitter finishing
             @(posedge i_clk);        // let the FSM react to tx_full going low
         end
     endtask
@@ -94,6 +92,8 @@ module tb_controller;
             deliver_rx_byte(value);
 
             for (k = 0; k < 5; k = k + 1) begin
+                while (!o_tx_start)
+                    @(posedge i_clk);
                 check(o_tx_select == k[2:0], "tx_select does not match the expected response index");
                 emulate_tx();
             end

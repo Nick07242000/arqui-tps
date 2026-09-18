@@ -75,8 +75,6 @@ module controller (
 
             // Wait for a new command byte.
             STATE_IDLE: begin
-                next_tx_select = 3'd0;
-
                 if (!i_rx_empty) begin
                     next_command = i_rx_data;
                     o_rx_read    = 1'b1;
@@ -132,8 +130,10 @@ module controller (
             // Wait for the current response byte to finish transmitting.
             STATE_WAIT_TX_DONE: begin
                 if (!i_tx_full) begin
-                    if (tx_select == 3'd4)
-                        next_state = STATE_IDLE;
+                    if (tx_select == 3'd4) begin
+                        next_tx_select = 3'd0;
+                        next_state     = STATE_IDLE;
+                    end
                     else begin
                         next_tx_select = tx_select + 1'b1;
                         next_state     = STATE_WAIT_TX_READY;
