@@ -182,11 +182,11 @@ stalls y flushes deben preservar el orden lógico de los efectos
 observables: escrituras de registros, stores y cambios de flujo deben
 corresponder al programa ejecutado.
 
-La consigna no impone una implementación concreta de forwarding,
-predicción de saltos o detección de riesgos. Sí exige que la ejecución
-sea correcta. Por simplicidad, una primera implementación puede usar
-stalls y flushes conservadores; luego se puede añadir forwarding si se
-mantiene la verificación.
+La consigna no impone una implementación concreta de forwarding ni una política única de detección de riesgos. Para este proyecto se recomienda implementar forwarding desde los registros de pipeline `EX/MEM` y `MEM/WB` hacia las entradas de la etapa EX, ya que permite resolver la mayoría de las dependencias entre instrucciones sin introducir esperas innecesarias.
+
+Las dependencias *load-use* requieren un tratamiento adicional cuando el dato leído de memoria todavía no está disponible para la instrucción siguiente. En ese caso, se debe insertar un stall, conservar las instrucciones que aún no pueden avanzar e introducir una burbuja en el lugar correspondiente. Si el tiempo de implementación resulta insuficiente, puede adoptarse como alternativa una estrategia basada exclusivamente en stalls, siempre que detecte correctamente las dependencias, preserve las instrucciones y sus efectos, y supere las mismas pruebas funcionales.
+
+La estrategia seleccionada debe documentarse y verificarse mediante pruebas de dependencias consecutivas, cadenas de dependencias, instrucciones de carga y uso inmediato del dato.
 
 ## 5. Formatos y semántica de las instrucciones RISC-V requeridas
 
@@ -248,48 +248,25 @@ parcialmente cargado.
 
 ### 6.1 Estado al cargar/reiniciar
 
-La consigna pide justificar si es necesario vaciar memoria, registros,
-pipeline y memoria de programa. No prescribe una única respuesta; debe
-documentarse la política adoptada.
+La política adoptada distingue el reset del procesador de la carga de un nuevo programa. Al resetear, el PC vuelve a cero, los registros `x1`–`x31` se inicializan en cero y todos los latches del pipeline se invalidan. `x0` permanece siempre en cero.
 
-Una política de inicio reproducible puede: 1. poner el PC en la
-dirección inicial; 2. invalidar/vaciar todos los latches del pipeline;
-3. impedir escrituras del CPU durante el reinicio; 4. definir si se
-reinician los registros y la memoria de datos; 5. borrar la memoria de
-programa solo si el protocolo o el requisito de seguridad lo necesita, y
-luego cargar las nuevas instrucciones; 6. marcar el programa como listo
-únicamente cuando la carga se completó y validó.
+La memoria de datos no se borra automáticamente. Esto evita implementar un recorrido adicional para limpiar toda la memoria; los programas de prueba deben inicializar explícitamente las posiciones que utilicen.
 
-Borrar la memoria de datos no siempre es necesario para ejecutar un
-programa, pero es importante para obtener pruebas reproducibles si el
-programa depende de su contenido inicial. Preservarla también puede ser
-una funcionalidad válida si se documenta. No debe dejarse el
-comportamiento accidental.
+Al cargar un programa nuevo, la CPU permanece detenida. La Debug Unit escribe las primeras `N_WORDS` palabras de la memoria de programa y registra la longitud de la imagen. No es necesario borrar las posiciones restantes porque el control de fin de imagen impide ejecutarlas. La CPU solo puede comenzar cuando la carga se completó y la longitud se validó.
 
 ## 7. HALT, fin de programa y vaciado del pipeline
 
-La consigna requiere una instrucción de parada (`HALT` o `STOP`) y que
-al finalizar la ejecución el pipeline quede vacío. HALT debe tener una
-semántica de control definida. No se debe suponer que existe como
-instrucción estándar de la ISA base RISC-V; puede implementarse como una
-convención del proyecto o como una instrucción especial acordada,
-siempre que el ensamblador/traductor y el procesador coincidan.
+La consigna requiere una instrucción de parada y que el pipeline quede vacío al finalizar la ejecución. En este proyecto se implementará `HALT` como una instrucción custom de RISC-V, en lugar de depender exclusivamente de una convención externa o de interpretar cualquier instrucción desconocida como una orden de parada.
 
-Al detectar HALT, no basta necesariamente con congelar todo
-inmediatamente: puede haber instrucciones anteriores todavía en el
-pipeline que deban completar sus efectos. El diseño debe detener la
-incorporación de instrucciones nuevas, permitir que las instrucciones
-válidas anteriores terminen y evitar que instrucciones posteriores a
-HALT produzcan efectos. El estado final se declara alcanzado cuando no
-quedan instrucciones válidas en las etapas y no hay operaciones
-pendientes.
+Se utilizará la codificación fija `0x0000000B`, correspondiente al opcode `custom-0` de RISC-V con el resto de los campos en cero. El decodificador reconocerá la palabra completa como `HALT`. Esta instrucción no forma parte de la ISA base RV32I, por lo que el ensamblador utilizado deberá permitir incorporarla, por ejemplo, mediante una directiva `.word 0x0000000B` o mediante una pequeña transformación del programa que convierta la instrucción simbólica `halt` en esa palabra máquina.
 
-Si la memoria no contiene HALT, la consigna exige responder qué sucede.
-Debe definirse una política explícita: por ejemplo, usar la longitud
-validada del programa cargado como límite y tratar el fin de la imagen
-como detención, o informar un error/timeout si el PC sale de la región
-cargada. Ejecutar indefinidamente palabras no cargadas no es un
-comportamiento aceptable por accidente.
+Al detectar `HALT`, el procesador debe dejar de buscar instrucciones nuevas y evitar que cualquier instrucción posterior a ella produzca efectos arquitectónicos. Sin embargo, las instrucciones válidas anteriores a `HALT` deben completar sus operaciones pendientes, incluyendo escrituras de registros y accesos de escritura a memoria. Por lo tanto, la detección de `HALT` inicia el proceso de finalización, pero no debe declarar inmediatamente que el programa terminó.
+
+Se recomienda representar la validez de las instrucciones en las etapas del pipeline. La señal `done` se activa solamente cuando no quedan instrucciones válidas en las etapas y no hay efectos previos pendientes. De esta forma, el estado final que consulta la Debug Unit refleja todos los efectos de las instrucciones anteriores a `HALT`, sin ejecutar instrucciones posteriores.
+
+La longitud de la imagen cargada, expresada en cantidad de palabras de 32 bits (`N_WORDS`), se conservará como protección adicional. Si el PC alcanza el final de la imagen sin encontrar `HALT`, el procesador deberá detener la búsqueda y finalizar mediante la misma lógica de vaciado, informando que se alcanzó el final de la imagen sin una instrucción explícita de parada. Si el PC intenta acceder fuera de la región cargada, no debe ejecutar contenido residual de la memoria de programa.
+
+La memoria de programa puede contener palabras antiguas después del último elemento de una imagen más corta. Esto no constituye un problema si el límite `N_WORDS` se actualiza en cada carga y se comprueba antes de aceptar una nueva instrucción. La carga de un programa nuevo también debe invalidar el estado de ejecución anterior y vaciar el pipeline antes de comenzar una nueva ejecución.
 
 ## 8. UART, Debug Unit e interfaz de PC
 
@@ -311,11 +288,7 @@ errores. La interfaz no debe necesitar conocer detalles eléctricos de la
 UART; debe operar sobre el protocolo de comandos definido por el
 proyecto.
 
-**Decisión de diseño recomendada:** especificar un protocolo versionado
-y con respuestas explícitas (`OK`, `ERROR`, datos), límites de longitud,
-validación de direcciones y manejo de comandos recibidos mientras el CPU
-corre. UART RX/TX debe seguir funcionando sin alterar el clock del
-procesador.
+**Decisión de diseño adoptada:** utilizar UART a 115200 baudios, 8-N-1, con mensajes binarios que incluyan comando, longitud y datos. Cada comando devuelve una respuesta de éxito o error. Las consultas completas de registros, pipeline y memoria se realizan con la CPU pausada o finalizada. La UART debe permanecer operativa mientras el procesador está pausado, sin intervenir el clock físico.
 
 ## 9. Modos de ejecución y clock
 
@@ -349,11 +322,7 @@ temporal disponible y provocar violaciones de setup/hold. Debe
 distinguirse de los retardos de datos y no inferirse únicamente porque
 un camino sea largo.
 
-La frecuencia final debe justificarse con los reportes de timing de
-Vivado para la implementación integrada. Si aparecen violaciones, se
-debe identificar su causa, corregirlas o seleccionar una frecuencia
-compatible y registrar las métricas. No se debe declarar que el diseño
-cumple timing solo porque la simulación funcional pasa.
+La frecuencia final se justificará mediante los reportes de timing de la herramienta correspondiente a la FPGA utilizada. Para la Tang Nano 20K, se utilizará Gowin EDA. Se documentarán el camino crítico, las métricas de slack y la evidencia disponible sobre skew. Si se detectan violaciones, se corregirá su causa o se seleccionará una frecuencia compatible. La consigna menciona Vivado, por lo que se deberá confirmar con el profesor si acepta los reportes equivalentes de Gowin EDA para esta placa.
 
 ## 10. Verificación: cómo convertir teoría en pruebas
 
