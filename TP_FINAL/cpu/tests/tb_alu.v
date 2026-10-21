@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 `include "alu_ops.vh"
 
-module alu_tb;
+module tb_alu;
 
     reg  [31:0] operand_a;
     reg  [31:0] operand_b;
