@@ -1,11 +1,6 @@
 `timescale 1ns / 1ps
 `include "alu_ops.vh"
 
-// -----------------------------------------------------------------------------
-// alu_tb
-// Testbench autoverificable de la ALU. Cada caso define operacion, operandos
-// y resultado esperado; al final se informa PASS/FAIL global.
-// -----------------------------------------------------------------------------
 module alu_tb;
 
     reg  [31:0] operand_a;
