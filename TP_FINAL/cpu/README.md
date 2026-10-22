@@ -378,3 +378,172 @@ Salidas de `control_unit`: `o_alu_op = ADD`, `o_alu_src_b_is_imm = 1`, `o_imm_ty
 ### Relación con la teoría
 
 En Patterson & Hennessy la unidad de control principal recibe solo el `opcode`, y un bloque aparte (`ALU Control`) usa `funct3`/`funct7`. Este módulo **fusiona ambos** y además detecta instrucciones ilegales. Es una desviación consciente: evita un módulo más y concentra toda la clasificación de instrucciones en un único `case`.
+
+## Memorias
+
+### Qué hace este bloque
+
+El procesador necesita dos memorias separadas (arquitectura Harvard):
+
+- **Memoria de programa** (`program_memory`): guarda las instrucciones. La CPU solo la lee; la Debug Unit la escribe cuando se carga un programa por UART.
+- **Memoria de datos** (`data_memory`): guarda los datos del programa. La CPU lee y escribe durante la etapa MEM; la Debug Unit puede leerla para mostrarla en la PC.
+
+Al estar separadas, la búsqueda de una instrucción (IF) y el acceso a datos (MEM) nunca compiten por el mismo recurso: no hay riesgo estructural.
+
+Como `data_memory` guarda palabras de 32 bits pero RISC-V también accede a bytes y medias palabras, se agregan dos módulos combinacionales auxiliares que adaptan el dato en la entrada (stores) y en la salida (loads).
+
+| Módulo | Rol |
+| --- | --- |
+| `program_memory` | Memoria de instrucciones, 1024 × 32 bits |
+| `data_memory` | Memoria de datos, 1024 × 32 bits, en 4 bancos de byte |
+| `store_data_formatter` | Prepara `sb`/`sh`/`sw`: ubica el dato y decide qué bytes se escriben |
+| `load_data_extender` | Prepara `lb`/`lh`/`lw`/`lbu`/`lhu`: elige el byte/media palabra y extiende signo o ceros |
+
+### Parámetros generales
+
+| Parámetro | Valor |
+| --- | --- |
+| Profundidad | 1024 palabras (4 KiB) en cada memoria |
+| Ancho de dirección | 10 bits (índice de palabra) |
+| Latencia de lectura | **1 ciclo** (lectura síncrona, compatible con BSRAM de la FPGA) |
+| Contenido tras reset o carga | Se conserva (la política de reset no borra las memorias) |
+
+Las direcciones que reciben los módulos son **índices de palabra**: el CPU debe pasar `pc[11:2]` a la memoria de programa y `dirección[11:2]` a la de datos. Los 2 bits bajos de la dirección no se usan para indexar; se emplean aparte para elegir el byte dentro de la palabra.
+
+### `program_memory`
+
+Es una RAM con un puerto de lectura (CPU) y otro de escritura (Debug Unit), que funcionan de forma independiente.
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Reloj del sistema |
+| `i_read_enable` | in | 1 | Habilita la lectura (`cpu_en && !stall`) |
+| `i_read_addr` | in | 10 | Índice de palabra a leer |
+| `o_read_data` | out | 32 | Instrucción leída, disponible al ciclo siguiente |
+| `i_write_enable` | in | 1 | Escribe una palabra (Debug Unit, durante la carga) |
+| `i_write_addr` | in | 10 | Índice de palabra a escribir |
+| `i_write_data` | in | 32 | Instrucción a guardar |
+
+**Comportamiento**
+
+- La salida `o_read_data` es un registro: actúa como el campo `instr` del latch `IF/ID`. Si `i_read_enable` está en 0, **conserva** su valor; así el pipeline puede congelar `IF/ID` durante un stall sin tocar el reloj.
+- Si se lee y escribe la misma dirección en el mismo ciclo, la lectura devuelve el valor **anterior**. Esto no ocurre en el sistema real, porque la Debug Unit solo escribe con la CPU detenida.
+- Escribir no requiere `i_read_enable`: la carga funciona con la CPU parada.
+
+### `data_memory`
+
+Está formada por **4 bancos de 1024 × 8 bits** (uno por byte de la palabra). Esto permite escribir solo los bytes necesarios sin leer antes la palabra, y facilita que la herramienta de síntesis la mapee a BSRAM.
+
+```text
+palabra de 32 bits:   [ banco 3 | banco 2 | banco 1 | banco 0 ]
+                        bits     bits      bits      bits
+                       31..24   23..16    15..8      7..0
+```
+
+Tiene dos puertos:
+
+- **Puerto A (CPU):** lectura de palabra completa y escritura con habilitación individual por byte.
+- **Puerto B (debug):** solo lectura. Tiene su propio registro de salida, por lo que consultar la memoria desde la Debug Unit **no altera** nada de lo que ve la CPU.
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Reloj del sistema |
+| `i_read_enable` | in | 1 | Habilita la lectura del puerto A |
+| `i_word_addr` | in | 10 | Índice de palabra (lectura y escritura del puerto A) |
+| `i_write_byte_enable` | in | 4 | Un bit por byte: 1 = escribir ese byte |
+| `i_write_data` | in | 32 | Dato a escribir (ya ubicado en sus carriles) |
+| `o_read_data` | out | 32 | Palabra leída por el puerto A (1 ciclo de latencia) |
+| `i_debug_word_addr` | in | 10 | Índice de palabra para el puerto B |
+| `o_debug_read_data` | out | 32 | Palabra leída por el puerto B (1 ciclo de latencia) |
+
+**Comportamiento**
+
+- `i_write_byte_enable = 4'b0000` significa que no hay escritura. Quien instancie la memoria debe dejarlo en 0 cuando la instrucción no sea válida, la dirección esté fuera de rango o la CPU no avance (`cpu_en = 0`).
+- Un store escrito en el ciclo MEM es visible para un load que acceda a esa dirección en el ciclo siguiente.
+- La memoria no valida rangos: el chequeo de direcciones fuera de `0x0000_0000–0x0000_0FFF` lo realiza el CPU antes de llegar acá.
+
+### `store_data_formatter`
+
+Convierte un store en lo que la memoria necesita: **el dato replicado** en los carriles de byte y **qué bytes escribir**. Es puramente combinacional.
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_mem_write` | in | 1 | La instrucción es un store |
+| `i_funct3` | in | 3 | Tamaño del store (`000` sb, `001` sh, `010` sw) |
+| `i_byte_offset` | in | 2 | Bits bajos de la dirección (`addr[1:0]`) |
+| `i_store_data` | in | 32 | Valor del registro a guardar |
+| `o_write_byte_enable` | out | 4 | Bytes a escribir en `data_memory` |
+| `o_write_data` | out | 32 | Dato replicado en los carriles |
+
+| Store | `o_write_data` | `o_write_byte_enable` |
+| --- | --- | --- |
+| `sb` | `{4{dato[7:0]}}` | `0001 << offset` |
+| `sh` | `{2{dato[15:0]}}` | `offset[1] ? 1100 : 0011` |
+| `sw` | `dato` | `1111` |
+
+Replicar el dato evita usar desplazadores: cada byte de la memoria recibe siempre el mismo carril de entrada y solo se escribe el habilitado. Si `i_funct3` no corresponde a un store válido, no se escribe nada.
+### `load_data_extender`
+
+Toma la palabra leída de la memoria y arma el resultado del load: elige el byte o media palabra según el offset y extiende el valor a 32 bits.
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_funct3` | in | 3 | Tipo de load |
+| `i_byte_offset` | in | 2 | Bits bajos de la dirección (`addr[1:0]`) |
+| `i_raw_word` | in | 32 | Palabra leída de `data_memory` |
+| `o_load_data` | out | 32 | Valor final para escribir en el registro destino |
+
+| Load | `funct3` | Selección | Extensión |
+| --- | --- | --- | --- |
+| `lb` | `000` | byte `offset[1:0]` | signo |
+| `lh` | `001` | media palabra `offset[1]` | signo |
+| `lw` | `010` | palabra completa | — |
+| `lbu` | `100` | byte `offset[1:0]` | ceros |
+| `lhu` | `101` | media palabra `offset[1]` | ceros |
+
+Un `funct3` no soportado devuelve 0.
+
+### Cómo se conectan en el pipeline
+
+```text
+  EX/MEM                                                          MEM/WB → WB
+  ──────                                                          ───────────
+  store_data ─► store_data_formatter ─► data_memory (puerto A) ─► load_data_extender ─► registro destino
+  funct3, addr[1:0] ─────┘                  ▲   │ (mem_raw)             ▲
+  addr[11:2] ───────────────────────────────┘   └─ se guarda en MEM/WB ─┘
+```
+
+1. En **MEM**, el formatter transforma el store y `data_memory` lo escribe; en un load, la memoria devuelve la palabra completa, que se registra en `MEM/WB.mem_raw`.
+2. En **WB**, `load_data_extender` elige el byte/media palabra y extiende, y el resultado se escribe en el banco de registros (o se adelanta por forwarding).
+
+### Casos definidos
+
+| Caso | Comportamiento |
+| --- | --- |
+| Acceso desalineado (`lh`/`sh` con `addr[0]=1`, `lw`/`sw` con `addr[1:0]≠0`) | Fuera de contrato: se ignoran los bits bajos y se alinea hacia abajo. Sin excepción |
+| `funct3` no soportado | Store sin efecto; load devuelve 0 |
+| Lectura sin `read_enable` | La salida mantiene el último valor leído |
+
+### Verificación
+
+Dos testbenches autoverificables (`tb_program_memory`, `tb_data_memory`) comparan cada resultado con un valor esperado e imprimen `ok`/`FAIL`. Ambos terminan con **todas las pruebas aprobadas**.
+
+| Testbench | Qué comprueba |
+| --- | --- |
+| `tb_program_memory` | Escritura y lectura, límites (direcciones 0 y 1023), secuencias, retención sin enable, sobrescritura, lectura y escritura simultáneas en la misma dirección, escritura con la lectura deshabilitada |
+| `tb_data_memory` | `sw`/`lw`; `sb` en los 4 carriles; `sh` en ambas mitades; `lb`/`lbu`/`lh`/`lhu` con signo y sin signo; stores parciales que preservan los bytes vecinos; alineación hacia abajo; límites de dirección; stores sin `mem_write` o con `funct3` inválido; retención sin `read_enable`; puerto B de debug (lectura correcta y sin alterar el puerto A) |
+
+`tb_data_memory` prueba la cadena completa `store_data_formatter → data_memory → load_data_extender`, que es como se usa en el pipeline.
+
+### Archivos
+
+| Archivo | Contenido |
+| --- | --- |
+| `program_memory.v` | Memoria de programa |
+| `data_memory.v` | Memoria de datos con puertos A y B |
+| `store_data_formatter.v` | Formato de escritura para stores |
+| `load_data_extender.v` | Selección y extensión para loads |
+| `tb_program_memory.v` | Testbench de la memoria de programa |
+| `tb_data_memory.v` | Testbench del subsistema de datos |
+
+Dependencia: `riscv_defs.vh` (constantes de `funct3`).
