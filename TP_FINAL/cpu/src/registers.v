@@ -1,7 +1,6 @@
 // -----------------------------------------------------------------------------
 // Banco de registros RISC-V: 32 registros de 32 bits.
 // -----------------------------------------------------------------------------
-
 module register_file #(
     parameter DATA_WIDTH = 32,
     parameter ADDR_WIDTH = 5,

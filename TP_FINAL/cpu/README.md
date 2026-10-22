@@ -203,7 +203,6 @@ El banco incluye un **bypass**: si detecta que se está escribiendo justo el reg
 
 El bypass **solo se activa si la escritura es efectiva** (reglas de la sección 3.3). Si el CPU está pausado, la lectura devuelve el valor guardado, porque esa escritura no se va a concretar.
 
-
 ### Puerto de depuración
 
 El banco ofrece un tercer puerto de **solo lectura** para la Debug Unit, que permite consultar cualquiera de los 32 registros y enviarlos por UART a la PC.
@@ -249,3 +248,133 @@ El módulo es parametrizable (`DATA_WIDTH`, `ADDR_WIDTH`, `REG_COUNT`), con valo
 | --- | --- |
 | `src/registers.v` | Implementación del banco de registros |
 | `tests/tb_registers.v` | Testbench autoverificable |
+
+## Unidad de control
+
+### ¿Qué hace?
+
+El procesador recibe cada instrucción como un número de 32 bits que, por sí solo, no dice nada. La unidad de control **decide qué hay que hacer con ella**: ¿qué operación es?, ¿escribe un registro?, ¿lee o escribe memoria?, ¿es un salto?, ¿es válida?
+
+Trabaja en la etapa **ID (Instruction Decode)** y es **lógica combinacional pura**: no tiene reloj ni memoria. Apenas cambia la instrucción de entrada, cambian sus salidas. No es una máquina de estados.
+
+Solo **decide**. El cableado de los campos de la instrucción (`rs1`, `rs2`, `rd`, `funct3`) no pasa por este módulo: la etapa ID los corta directamente del latch `IF/ID`, como se dibuja en los diagramas de datapath de la bibliografía.
+
+```mermaid
+flowchart LR
+  IFID["Latch IF/ID<br/>instrucción de 32 bits"] -->|"i_instruction"| CU["control_unit<br/>decide"]
+  IFID -->|"rs1, rs2 (cableado directo)"| RF["register_file"]
+  IFID -->|"rd, funct3 (cableado directo)"| IDEX["Latch ID/EX"]
+  CU -->|"o_imm_type"| IG["immediate_generator"]
+  CU -->|"señales de control"| IDEX
+```
+
+### Entradas y salidas
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_instruction` | in | 32 | Instrucción a decodificar. |
+| `o_alu_op` | out | 4 | Operación que debe ejecutar la ALU. |
+| `o_alu_src_b_is_imm` | out | 1 | `0`: el segundo operando de la ALU es `rs2`. `1`: es el inmediato. |
+| `o_imm_type` | out | 3 | Formato del inmediato (I, S, B, U, J o ninguno). |
+| `o_reg_write` | out | 1 | La instrucción escribe un registro destino. |
+| `o_mem_read` | out | 1 | La instrucción lee la memoria de datos (load). |
+| `o_mem_write` | out | 1 | La instrucción escribe la memoria de datos (store). |
+| `o_is_branch` | out | 1 | Salto condicional (`beq`, `bne`). |
+| `o_is_jal` | out | 1 | Salto incondicional `jal`. |
+| `o_is_jalr` | out | 1 | Salto a registro `jalr`. |
+| `o_is_halt` | out | 1 | Instrucción de parada. |
+| `o_is_illegal` | out | 1 | Instrucción no soportada. |
+| `o_uses_rs1` | out | 1 | La instrucción realmente lee `rs1`. |
+| `o_uses_rs2` | out | 1 | La instrucción realmente lee `rs2`. |
+
+### Cómo se lee una instrucción RISC-V
+
+Toda instrucción mide 32 bits y se divide en **campos**. Los campos más importantes están siempre en la misma posición, lo que simplifica el hardware:
+
+```text
+ 31        25 24   20 19   15 14  12 11    7 6      0
+┌────────────┬───────┬───────┬──────┬───────┬────────┐
+│   funct7   │  rs2  │  rs1  │funct3│  rd   │ opcode │   (formato R)
+└────────────┴───────┴───────┴──────┴───────┴────────┘
+```
+
+| Campo | Bits | Para qué sirve | Quién lo usa |
+| --- | --- | --- | --- |
+| `opcode` | 6:0 | Familia de la instrucción. | `control_unit` |
+| `funct3` | 14:12 | Distingue instrucciones dentro de una familia. | `control_unit` para decidir; la etapa ID lo envía por separado para loads/stores. |
+| `funct7` | 31:25 | Segundo nivel de distinción (`add` vs `sub`). | `control_unit` |
+| `rs1` | 19:15 | Primer registro **fuente**. | `register_file`, unidad de riesgos (cableado directo) |
+| `rs2` | 24:20 | Segundo registro fuente. | `register_file`, unidad de riesgos (cableado directo) |
+| `rd` | 11:7 | Registro **destino**. | Latch `ID/EX` (cableado directo) |
+
+### Cómo funciona
+
+1. **Se lee el `opcode`** para saber la familia de la instrucción.
+2. **Se verifica que la combinación `funct3`/`funct7` sea válida** para esa familia. Si no lo es, la instrucción es ilegal.
+3. **Se activan las señales** de esa instrucción. Todo parte de un valor por defecto "ilegal y neutralizada", y cada instrucción válida activa solo lo que necesita.
+
+#### Elección de la operación de la ALU
+
+La propia codificación RISC-V ya distingue las operaciones: la operación es `{bit 30, funct3}`.
+
+| Instrucción | `funct3` | Bit 30 | `o_alu_op` |
+| --- | --- | --- | --- |
+| `add` / `addi` | `000` | 0 | `ADD` |
+| `sub` | `000` | 1 | `SUB` |
+| `srl` / `srli` | `101` | 0 | `SRL` |
+| `sra` / `srai` | `101` | 1 | `SRA` |
+
+> **Detalle importante:** en las instrucciones con inmediato, el bit 30 puede ser parte de la constante. Un `addi x1, x0, -1` tiene ese bit en 1 y **no** es una resta. Por eso, en ese formato el bit 30 solo se considera cuando la instrucción es un desplazamiento a la derecha (`srai`).
+
+`lui` usa la operación `PASS_B`, que deja pasar el inmediato sin modificarlo. Las instrucciones que no usan la ALU (como `jal` o los branches) dejan `o_alu_op` en `ADD`, un valor sin importancia.
+
+### Señales de control por tipo de instrucción
+
+| Clase | `o_alu_src_b_is_imm` | `o_reg_write` | `o_mem_read` | `o_mem_write` | Salto | `o_uses_rs1` | `o_uses_rs2` | `o_imm_type` |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| R | 0 | 1 | 0 | 0 | – | 1 | 1 | NONE |
+| I aritmética | 1 | 1 | 0 | 0 | – | 1 | 0 | I |
+| Load | 1 | 1 | 1 | 0 | – | 1 | 0 | I |
+| Store | 1 | 0 | 0 | 1 | – | 1 | 1 | S |
+| Branch | 0 | 0 | 0 | 0 | `o_is_branch` | 1 | 1 | B |
+| `jal` | 0 | 1 | 0 | 0 | `o_is_jal` | 0 | 0 | J |
+| `jalr` | 1 | 1 | 0 | 0 | `o_is_jalr` | 1 | 0 | I |
+| `lui` | 1 | 1 | 0 | 0 | – | 0 | 0 | U |
+| `HALT` | 0 | 0 | 0 | 0 | – | 0 | 0 | NONE |
+
+#### ¿Por qué existen `o_uses_rs1` y `o_uses_rs2`?
+
+En instrucciones como `jal` o `lui`, los bits donde normalmente estaría `rs1` o `rs2` contienen **parte de una constante**, no un registro. Si la detección de riesgos comparara esos bits con un registro destino, vería dependencias que no existen y frenaría el pipeline sin necesidad. Estas dos señales indican qué campos son fuentes de verdad.
+
+### Instrucciones ilegales: neutralizadas
+
+Cualquier palabra fuera de la lista soportada se considera **ilegal**: opcodes desconocidos, combinaciones inválidas de `funct3`/`funct7` (por ejemplo `blt`, `mul`, `ld`), la palabra `0x00000000` y cualquier `custom-0` distinto de `HALT`.
+
+Una instrucción ilegal queda **neutralizada**: solo se activa `o_is_illegal` y **todas las demás señales con efecto quedan en 0**. Así no puede escribir registros ni memoria por accidente, aunque recorra el pipeline.
+
+### `HALT`: instrucción de parada
+
+`HALT` es una instrucción propia del proyecto con la codificación fija **`0x0000000B`** (opcode `custom-0` de RISC-V, resto de los campos en cero). El decodificador compara la **palabra completa**, no solo el opcode, así que una instrucción parecida pero distinta se rechaza como ilegal.
+
+### Ejemplo: `addi x1, x0, 5` (`0x00500093`)
+
+| Campo | Valor | Interpretación |
+| --- | --- | --- |
+| `opcode` | `0010011` | Operación con inmediato |
+| `rd` | `1` | Resultado a `x1` (cableado directo) |
+| `funct3` | `000` | Suma |
+| `rs1` | `0` | Fuente: `x0` (cableado directo) |
+
+Salidas de `control_unit`: `o_alu_op = ADD`, `o_alu_src_b_is_imm = 1`, `o_imm_type = I`, `o_reg_write = 1`, `o_uses_rs1 = 1`, `o_uses_rs2 = 0`.
+
+### Verificación (`tb_control_unit`)
+
+- Prueba las **32 instrucciones obligatorias** y `HALT`, comparando operación de la ALU, tipo de inmediato y todas las banderas de control.
+- Incluye casos que evitan confusiones: `addi` con inmediato negativo, que no debe ser `sub`, y `addi` con el bit 30 activo.
+- Prueba **13 casos ilegales** (`ld`, `lwu`, `sd`, `blt`, `mul`, `auipc`, `custom-0` distinto de `HALT`, etc.) y exige que **solo** se active `o_is_illegal`.
+- En total son **51 verificaciones**, incluidas 3 palabras máquina literales de referencia independientes del código.
+- Termina con `TODAS LAS PRUEBAS PASARON` si no hay fallos.
+
+### Relación con la teoría
+
+En Patterson & Hennessy la unidad de control principal recibe solo el `opcode`, y un bloque aparte (`ALU Control`) usa `funct3`/`funct7`. Este módulo **fusiona ambos** y además detecta instrucciones ilegales. Es una desviación consciente: evita un módulo más y concentra toda la clasificación de instrucciones en un único `case`.
