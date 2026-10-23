@@ -363,6 +363,75 @@ Salidas de `control_unit`: `o_alu_op = ADD`, `o_alu_src_b_is_imm = 1`, `o_imm_ty
 
 En Patterson & Hennessy la unidad de control principal recibe solo el `opcode`, y un bloque aparte (`ALU Control`) usa `funct3`/`funct7`. Este módulo **fusiona ambos** y además detecta instrucciones ilegales. Es una desviación consciente: evita un módulo más y concentra toda la clasificación de instrucciones en un único `case`.
 
+## Generador de inmediatos (`immediate_generator`)
+
+### ¿Qué hace?
+
+Muchas instrucciones llevan una **constante escondida** dentro de sus 32 bits (por ejemplo, el `5` de `addi x1, x0, 5`). A esa constante se le llama **inmediato**. El generador de inmediatos la **extrae, la reordena si hace falta y la amplía a 32 bits**, para que la ALU pueda usarla.
+
+Es un módulo **puramente combinacional** de la etapa **ID**. El formato a usar se lo indica la unidad de control mediante `i_imm_type`.
+
+```mermaid
+flowchart LR
+  IFID["Latch IF/ID<br/>instrucción"] -->|"i_instruction"| IG["immediate_generator"]
+  CU["control_unit"] -->|"i_imm_type"| IG
+  IG -->|"o_immediate (32 bits)"| IDEX["Latch ID/EX"]
+```
+
+### Entradas y salidas
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_instruction` | in | 32 | Instrucción de la que se extrae la constante. |
+| `i_imm_type` | in | 3 | Formato a aplicar: I, S, B, U, J o NONE. |
+| `o_immediate` | out | 32 | Inmediato reconstruido y extendido. |
+
+### El problema: cada formato lo guarda distinto
+
+RISC-V reparte los bits del inmediato en posiciones distintas según el tipo de instrucción. Lo hace para que `rs1`, `rs2` y `rd` queden siempre en el mismo lugar. El costo es que los formatos **B** y **J** tienen los bits "desordenados" y hay que reconstruirlos.
+
+| Tipo | Usado por | Cómo se reconstruye | Rango aproximado |
+| --- | --- | --- | --- |
+| **I** | `addi`, `andi`, loads, `jalr`… | Bits `[31:20]`, extendidos en signo | −2048 … +2047 |
+| **S** | `sb`, `sh`, `sw` | Bits `[31:25]` y `[11:7]` unidos | −2048 … +2047 |
+| **B** | `beq`, `bne` | Bits `31`, `7`, `[30:25]`, `[11:8]` reordenados; bit 0 siempre en 0 | ±4 KiB (pasos de 2 bytes) |
+| **U** | `lui` | Bits `[31:12]` arriba; 12 bits bajos en 0 | múltiplos de 4096 |
+| **J** | `jal` | Bits `31`, `[19:12]`, `20`, `[30:21]` reordenados; bit 0 siempre en 0 | ±1 MiB (pasos de 2 bytes) |
+
+### Extensión de signo
+
+La instrucción solo reserva 12 o 20 bits para la constante, pero la ALU trabaja con 32. Para que el valor **no cambie**, se copian hacia la izquierda el bit de signo (siempre es el bit 31 de la instrucción).
+
+| Constante original | Ampliada a 32 bits |
+| --- | --- |
+| `+5` (12 bits: `0000_0000_0101`) | `0x00000005` |
+| `−1` (12 bits: `1111_1111_1111`) | `0xFFFFFFFF` |
+
+### Cómo funciona
+
+1. Calcula **en paralelo** los cinco inmediatos posibles (I, S, B, U, J), cada uno con su regla de reordenamiento.
+2. Según `i_imm_type`, **elige uno** como salida.
+3. Si el tipo es `NONE` (instrucciones sin inmediato, o ilegales), la salida es `0`.
+
+### Ejemplo: `jal x1, +8` (`0x008000EF`)
+
+En el formato J los bits de la constante están dispersos. Para el valor `+8` (binario `1000`), el bit que vale `8` queda en el bit 23 de la instrucción. El generador lo coloca en su posición real (bit 3) y completa el resto con ceros:
+
+| Paso | Resultado |
+| --- | --- |
+| Bits tomados de la instrucción y reordenados | `imm[20:1]` reconstruido |
+| Bit 0 | Siempre `0` (los saltos son a direcciones pares) |
+| Extensión de signo | Bit 31 = 0, rellena con ceros |
+| **`o_immediate`** | **`0x00000008`** |
+
+### Decisiones de diseño
+
+| Decisión | Motivo |
+| --- | --- |
+| El formato llega por `i_imm_type` desde la unidad de control | El generador no repite la clasificación de instrucciones. |
+| Se calculan los cinco inmediatos en paralelo | Código simple y de lectura directa; la selección final es un único multiplexor. |
+| Los shifts con inmediato no reciben tratamiento especial | La ALU usa solo `B[4:0]` como cantidad de desplazamiento, así que alcanza con el inmediato tipo I. |
+
 ## Memorias
 
 ### Qué hace este bloque
