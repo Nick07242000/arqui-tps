@@ -106,22 +106,6 @@ Algunos casos son especiales:
 - **No tiene estado.** No guarda valores ni depende del reloj.
 - **No genera señales de error.** No hay banderas de overflow, cero o acarreo.
 
-### Cómo se verificó
-
-Se escribió un testbench autoverificable: cada caso define la operación, los operandos y el **resultado esperado**, y el testbench compara contra el resultado real de la ALU. Al final informa `PASS` o `FAIL`.
-
-| Aspecto | Qué se probó |
-| --- | --- |
-| Aritmética | Casos normales, overflow, underflow, negativos, máximo positivo y mínimo negativo |
-| Lógicas | Patrones alternados y operandos iguales |
-| Desplazamientos | Cantidades 0 y 31, y que solo se usen los 5 bits bajos |
-| SRA vs. SRL | Con valores negativos y positivos |
-| SLT vs. SLTU | Casos donde los resultados difieren |
-| PASS_B | Que devuelva exactamente B |
-| Códigos no definidos | Que devuelvan 0 |
-
-**Resultado:** 40 pruebas, 0 errores.
-
 ### Archivos del módulo
 
 | Archivo | Contenido |
@@ -523,17 +507,6 @@ Un `funct3` no soportado devuelve 0.
 | Acceso desalineado (`lh`/`sh` con `addr[0]=1`, `lw`/`sw` con `addr[1:0]≠0`) | Fuera de contrato: se ignoran los bits bajos y se alinea hacia abajo. Sin excepción |
 | `funct3` no soportado | Store sin efecto; load devuelve 0 |
 | Lectura sin `read_enable` | La salida mantiene el último valor leído |
-
-### Verificación
-
-Dos testbenches autoverificables (`tb_program_memory`, `tb_data_memory`) comparan cada resultado con un valor esperado e imprimen `ok`/`FAIL`. Ambos terminan con **todas las pruebas aprobadas**.
-
-| Testbench | Qué comprueba |
-| --- | --- |
-| `tb_program_memory` | Escritura y lectura, límites (direcciones 0 y 1023), secuencias, retención sin enable, sobrescritura, lectura y escritura simultáneas en la misma dirección, escritura con la lectura deshabilitada |
-| `tb_data_memory` | `sw`/`lw`; `sb` en los 4 carriles; `sh` en ambas mitades; `lb`/`lbu`/`lh`/`lhu` con signo y sin signo; stores parciales que preservan los bytes vecinos; alineación hacia abajo; límites de dirección; stores sin `mem_write` o con `funct3` inválido; retención sin `read_enable`; puerto B de debug (lectura correcta y sin alterar el puerto A) |
-
-`tb_data_memory` prueba la cadena completa `store_data_formatter → data_memory → load_data_extender`, que es como se usa en el pipeline.
 
 ### Archivos
 
