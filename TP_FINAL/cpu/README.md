@@ -424,6 +424,17 @@ En el formato J los bits de la constante están dispersos. Para el valor `+8` (b
 | Extensión de signo | Bit 31 = 0, rellena con ceros |
 | **`o_immediate`** | **`0x00000008`** |
 
+### Verificación
+
+Usa **palabras máquina conocidas**, codificadas a mano según la especificación, con el resultado esperado explícito:
+
+- **Tipo I:** `+5`, `−1`, máximo (`+2047`) y mínimo (`−2048`).
+- **Tipo S:** `+8` y `−4`.
+- **Tipo B:** `+8`, `−4` y dos casos que activan **un único bit** (`imm[11]` y `imm[12]`) para confirmar el reordenamiento.
+- **Tipo U:** `0x12345000` y `0xFFFFF000`.
+- **Tipo J:** `+8`, `−4` y casos con un único bit (`imm[11]`, `imm[12]`, `imm[20]`).
+- **Tipo NONE:** la salida debe ser `0`.
+
 ### Decisiones de diseño
 
 | Decisión | Motivo |
