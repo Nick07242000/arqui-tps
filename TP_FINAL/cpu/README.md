@@ -167,7 +167,7 @@ Si falta alguna, no se guarda nada. Esto garantiza que una burbuja del pipeline 
 **El reset limpia todo.**
 Al resetear, los 32 registros vuelven a cero. El reset tiene prioridad sobre cualquier escritura simultánea. Así cada ejecución de un programa comienza desde un estado conocido y reproducible.
 
-El bypass: leer un dato que se está escribiendo
+### El bypass: leer un dato que se está escribiendo
 
 #### El problema
 
@@ -185,7 +185,7 @@ El banco incluye un **bypass**: si detecta que se está escribiendo justo el reg
 | Se lee el mismo registro que se está escribiendo | El **dato nuevo** (bypass) |
 | Cualquier otro caso | El valor almacenado en el registro |
 
-El bypass **solo se activa si la escritura es efectiva** (reglas de la sección 3.3). Si el CPU está pausado, la lectura devuelve el valor guardado, porque esa escritura no se va a concretar.
+El bypass **solo se activa si la escritura es efectiva** (las tres condiciones de escritura descritas arriba). Si el CPU está pausado, la lectura devuelve el valor guardado, porque esa escritura no se va a concretar.
 
 ### Puerto de depuración
 
@@ -193,6 +193,7 @@ El banco ofrece un tercer puerto de **solo lectura** para la Debug Unit, que per
 
 - Devuelve el valor **realmente almacenado**, sin bypass.
 - **No altera nada**: consultar el estado nunca cambia lo que está haciendo el CPU.
+- Como no pasa por el bypass, con el CPU pausado a mitad de una ejecución **todavía no muestra** el resultado de la instrucción que está en WB: ese valor se guarda recién cuando el CPU avanza el siguiente ciclo. Con la ejecución finalizada el pipeline está vacío, así que los valores son los definitivos.
 
 ### Interfaz del módulo
 
@@ -207,7 +208,7 @@ Convención de nombres: `i_` para entradas y `o_` para salidas.
 | `i_read_addr_b` | entrada | 5 | Registro a leer por el puerto B (`rs2`) |
 | `o_read_data_a` | salida | 32 | Valor leído por el puerto A |
 | `o_read_data_b` | salida | 32 | Valor leído por el puerto B |
-| `i_write_enable` | entrada | 1 | La instrucción en WB quiere escribir |
+| `i_write_enable` | entrada | 1 | La instrucción en WB es válida y quiere escribir (una burbuja llega con 0) |
 | `i_write_addr` | entrada | 5 | Registro destino (`rd`) |
 | `i_write_data` | entrada | 32 | Valor a guardar |
 | `i_debug_read_addr` | entrada | 5 | Registro a consultar desde debug |
@@ -246,7 +247,7 @@ Solo **decide**. El cableado de los campos de la instrucción (`rs1`, `rs2`, `rd
 ```mermaid
 flowchart LR
   IFID["Latch IF/ID<br/>instrucción de 32 bits"] -->|"i_instruction"| CU["control_unit<br/>decide"]
-  IFID -->|"rs1, rs2 (cableado directo)"| RF["register_file"]
+  IFID -->|"rs1, rs2 (cableado directo)"| RF["registers"]
   IFID -->|"rd, funct3 (cableado directo)"| IDEX["Latch ID/EX"]
   CU -->|"o_imm_type"| IG["immediate_generator"]
   CU -->|"señales de control"| IDEX
@@ -287,8 +288,8 @@ Toda instrucción mide 32 bits y se divide en **campos**. Los campos más import
 | `opcode` | 6:0 | Familia de la instrucción. | `control_unit` |
 | `funct3` | 14:12 | Distingue instrucciones dentro de una familia. | `control_unit` para decidir; la etapa ID lo envía por separado para loads/stores. |
 | `funct7` | 31:25 | Segundo nivel de distinción (`add` vs `sub`). | `control_unit` |
-| `rs1` | 19:15 | Primer registro **fuente**. | `register_file`, unidad de riesgos (cableado directo) |
-| `rs2` | 24:20 | Segundo registro fuente. | `register_file`, unidad de riesgos (cableado directo) |
+| `rs1` | 19:15 | Primer registro **fuente**. | `registers`, unidad de riesgos (cableado directo) |
+| `rs2` | 24:20 | Segundo registro fuente. | `registers`, unidad de riesgos (cableado directo) |
 | `rd` | 11:7 | Registro **destino**. | Latch `ID/EX` (cableado directo) |
 
 ### Cómo funciona
@@ -336,6 +337,10 @@ Cualquier palabra fuera de la lista soportada se considera **ilegal**: opcodes d
 
 Una instrucción ilegal queda **neutralizada**: solo se activa `o_is_illegal` y **todas las demás señales con efecto quedan en 0**. Así no puede escribir registros ni memoria por accidente, aunque recorra el pipeline.
 
+Neutralizada equivale a un `NOP`: el procesador no se detiene. Para que no pase inadvertida, la CPU levanta la bandera persistente `illegal_seen`, que se consulta con `GET_STATUS`.
+
+> **Al escribir programas:** los únicos saltos condicionales del procesador son `beq` y `bne`. Instrucciones como `blt`, `bge`, `bltu` y `bgeu`, las pseudoinstrucciones que el ensamblador traduce a ellas (`bgt`, `ble`, …) y `auipc` (que usan `la` y `call`) son ilegales. Por eso el script que prepara la imagen revisa cada palabra con la misma lista cerrada de instrucciones y rechaza el programa antes de enviarlo (la opción `--allow-unsupported` fuerza el envío, útil para probar la bandera).
+
 ### `HALT`: instrucción de parada
 
 `HALT` es una instrucción propia del proyecto con la codificación fija **`0x0000000B`** (opcode `custom-0` de RISC-V, resto de los campos en cero). El decodificador compara la **palabra completa**, no solo el opcode, así que una instrucción parecida pero distinta se rechaza como ilegal.
@@ -356,18 +361,28 @@ Salidas de `control_unit`: `o_alu_op = ADD`, `o_alu_src_b_is_imm = 1`, `o_imm_ty
 - Prueba las **32 instrucciones obligatorias** y `HALT`, comparando operación de la ALU, tipo de inmediato y todas las banderas de control.
 - Incluye casos que evitan confusiones: `addi` con inmediato negativo, que no debe ser `sub`, y `addi` con el bit 30 activo.
 - Prueba **13 casos ilegales** (`ld`, `lwu`, `sd`, `blt`, `mul`, `auipc`, `custom-0` distinto de `HALT`, etc.) y exige que **solo** se active `o_is_illegal`.
-- En total son **51 verificaciones**, incluidas 3 palabras máquina literales de referencia independientes del código.
+- En total son **51 verificaciones dirigidas**, incluidas 3 palabras máquina literales de referencia independientes del código.
+- Además recorre las **131 072 combinaciones** de `opcode`, `funct3` y `funct7` (con registros distintos de cero) y comprueba tres cosas: que la legalidad coincida con una lista de referencia escrita aparte del RTL, que ninguna instrucción ilegal active señales con efecto, y que el bit 30 de un inmediato nunca se interprete como `SUB` o `SRA`.
 - Termina con `TODAS LAS PRUEBAS PASARON` si no hay fallos.
 
 ### Relación con la teoría
 
-En Patterson & Hennessy la unidad de control principal recibe solo el `opcode`, y un bloque aparte (`ALU Control`) usa `funct3`/`funct7`. Este módulo **fusiona ambos** y además detecta instrucciones ilegales. Es una desviación consciente: evita un módulo más y concentra toda la clasificación de instrucciones en un único `case`.
+En Patterson & Hennessy la unidad de control principal recibe solo el `opcode`, y un bloque aparte (`ALU Control`) usa `funct3`/`funct7`. Este módulo **fusiona ambos** y además detecta instrucciones ilegales. Es una desviación consciente: evita un módulo más y concentra toda la clasificación de instrucciones en un único `case`. Además, como `o_alu_op` ya sale decidido de la etapa ID, la etapa EX no tiene que decodificar `funct3`/`funct7`, lo que le quita trabajo a la etapa más cargada.
 
-## Generador de inmediatos (`immediate_generator`)
+### Archivos del módulo
+
+| Archivo | Contenido |
+| --- | --- |
+| `src/control_unit.v` | Implementación de la unidad de control |
+| `src/riscv_defs.vh` | Opcodes, `funct3`/`funct7`, tipos de inmediato y `HALT` |
+| `src/alu_ops.vh` | Códigos de operación de la ALU |
+| `tests/tb_control_unit.v` | Testbench autoverificable |
+
+## Generador de inmediatos
 
 ### ¿Qué hace?
 
-Muchas instrucciones llevan una **constante escondida** dentro de sus 32 bits (por ejemplo, el `5` de `addi x1, x0, 5`). A esa constante se le llama **inmediato**. El generador de inmediatos la **extrae, la reordena si hace falta y la amplía a 32 bits**, para que la ALU pueda usarla.
+Muchas instrucciones llevan una **constante escondida** dentro de sus 32 bits (por ejemplo, el `5` de `addi x1, x0, 5`). A esa constante se le llama **inmediato**. El generador de inmediatos la **extrae, la reordena si hace falta y la amplía a 32 bits**, para que el resto del procesador pueda usarla.
 
 Es un módulo **puramente combinacional** de la etapa **ID**. El formato a usar se lo indica la unidad de control mediante `i_imm_type`.
 
@@ -386,6 +401,19 @@ flowchart LR
 | `i_imm_type` | in | 3 | Formato a aplicar: I, S, B, U, J o NONE. |
 | `o_immediate` | out | 32 | Inmediato reconstruido y extendido. |
 
+Los códigos de `i_imm_type` están definidos en `riscv_defs.vh`:
+
+| Tipo | Código | Qué devuelve `o_immediate` |
+| --- | :---: | --- |
+| `NONE` | `000` | `0` (instrucciones sin inmediato o ilegales) |
+| `I` | `001` | Inmediato tipo I |
+| `S` | `010` | Inmediato tipo S |
+| `B` | `011` | Inmediato tipo B |
+| `U` | `100` | Inmediato tipo U |
+| `J` | `101` | Inmediato tipo J |
+
+Cualquier otro código también devuelve `0`.
+
 ### El problema: cada formato lo guarda distinto
 
 RISC-V reparte los bits del inmediato en posiciones distintas según el tipo de instrucción. Lo hace para que `rs1`, `rs2` y `rd` queden siempre en el mismo lugar. El costo es que los formatos **B** y **J** tienen los bits "desordenados" y hay que reconstruirlos.
@@ -398,14 +426,18 @@ RISC-V reparte los bits del inmediato en posiciones distintas según el tipo de 
 | **U** | `lui` | Bits `[31:12]` arriba; 12 bits bajos en 0 | múltiplos de 4096 |
 | **J** | `jal` | Bits `31`, `[19:12]`, `20`, `[30:21]` reordenados; bit 0 siempre en 0 | ±1 MiB (pasos de 2 bytes) |
 
+> **Detalle de B y J:** el bit 0 se fija en 0 porque la codificación solo representa múltiplos de 2, de modo que sirva también cuando existen instrucciones comprimidas de 2 bytes. Este procesador no las soporta: todas las instrucciones miden 4 bytes y los destinos de salto válidos son múltiplos de 4. Un destino que no lo sea queda fuera de contrato.
+
 ### Extensión de signo
 
-La instrucción solo reserva 12 o 20 bits para la constante, pero la ALU trabaja con 32. Para que el valor **no cambie**, se copian hacia la izquierda el bit de signo (siempre es el bit 31 de la instrucción).
+La instrucción solo reserva 12 o 20 bits para la constante, pero el procesador trabaja con 32. Para que el valor **no cambie**, se copia hacia la izquierda el bit de signo (siempre es el bit 31 de la instrucción).
 
 | Constante original | Ampliada a 32 bits |
 | --- | --- |
 | `+5` (12 bits: `0000_0000_0101`) | `0x00000005` |
 | `−1` (12 bits: `1111_1111_1111`) | `0xFFFFFFFF` |
+
+> **Atención:** en RISC-V **todos** los inmediatos se extienden con signo, incluso los de `andi`, `ori` y `xori`. Es una diferencia con MIPS, donde esas instrucciones extienden con ceros.
 
 ### Cómo funciona
 
@@ -413,20 +445,33 @@ La instrucción solo reserva 12 o 20 bits para la constante, pero la ALU trabaja
 2. Según `i_imm_type`, **elige uno** como salida.
 3. Si el tipo es `NONE` (instrucciones sin inmediato, o ilegales), la salida es `0`.
 
+### ¿Para qué se usa cada inmediato?
+
+El inmediato viaja en el latch `ID/EX` y en EX se usa de dos maneras:
+
+| Tipo | Instrucciones | Uso en EX |
+| --- | --- | --- |
+| **I** | `addi`, `andi`, …, `jalr` y loads | Segundo operando de la ALU (en loads y `jalr`, para calcular la dirección o el destino) |
+| **S** | `sb`, `sh`, `sw` | Segundo operando de la ALU: dirección = `rs1 + inmediato` |
+| **U** | `lui` | La ALU lo deja pasar con `PASS_B` |
+| **B**, **J** | `beq`, `bne`, `jal` | Sumador dedicado `pc + inmediato`, que calcula el destino del salto |
+
 ### Ejemplo: `jal x1, +8` (`0x008000EF`)
 
 En el formato J los bits de la constante están dispersos. Para el valor `+8` (binario `1000`), el bit que vale `8` queda en el bit 23 de la instrucción. El generador lo coloca en su posición real (bit 3) y completa el resto con ceros:
 
 | Paso | Resultado |
 | --- | --- |
-| Bits tomados de la instrucción y reordenados | `imm[20:1]` reconstruido |
-| Bit 0 | Siempre `0` (los saltos son a direcciones pares) |
+| El `1` de la constante está en el bit 23 de la instrucción | Dentro del grupo `[30:21]`, corresponde a `imm[3]` |
+| Bit 0 | Siempre `0` (la codificación solo representa múltiplos de 2) |
 | Extensión de signo | Bit 31 = 0, rellena con ceros |
 | **`o_immediate`** | **`0x00000008`** |
 
-### Verificación
+### Verificación (`tb_immediate_generator`)
 
-Usa **palabras máquina conocidas**, codificadas a mano según la especificación, con el resultado esperado explícito:
+Combina dos tipos de prueba y termina con `TODAS LAS PRUEBAS PASARON` si no hay fallos.
+
+**1. Palabras máquina conocidas**, codificadas a mano según la especificación, con el resultado esperado explícito. Sirven de ancla independiente del código:
 
 - **Tipo I:** `+5`, `−1`, máximo (`+2047`) y mínimo (`−2048`).
 - **Tipo S:** `+8` y `−4`.
@@ -435,6 +480,8 @@ Usa **palabras máquina conocidas**, codificadas a mano según la especificació
 - **Tipo J:** `+8`, `−4` y casos con un único bit (`imm[11]`, `imm[12]`, `imm[20]`).
 - **Tipo NONE:** la salida debe ser `0`.
 
+**2. Barrido bit a bit.** Para cada formato recorre uno por uno los bits del inmediato y prueba dos casos por bit: ese bit solo en 1 (el resto en 0) y ese bit solo en 0 (el resto en 1). Las palabras de prueba las arma una función de referencia escrita aparte, a partir de la especificación. Así se detecta cualquier bit mal ubicado o intercambiado con otro, algo que los valores "redondos" de la primera parte no garantizan (por ejemplo, `−4` es casi todo unos y no distingue unos bits de otros).
+
 ### Decisiones de diseño
 
 | Decisión | Motivo |
@@ -442,6 +489,14 @@ Usa **palabras máquina conocidas**, codificadas a mano según la especificació
 | El formato llega por `i_imm_type` desde la unidad de control | El generador no repite la clasificación de instrucciones. |
 | Se calculan los cinco inmediatos en paralelo | Código simple y de lectura directa; la selección final es un único multiplexor. |
 | Los shifts con inmediato no reciben tratamiento especial | La ALU usa solo `B[4:0]` como cantidad de desplazamiento, así que alcanza con el inmediato tipo I. |
+
+### Archivos del módulo
+
+| Archivo | Contenido |
+| --- | --- |
+| `src/immediate_generator.v` | Implementación del generador de inmediatos |
+| `src/riscv_defs.vh` | Códigos de tipo de inmediato y opcodes (compartido con la unidad de control) |
+| `tests/tb_immediate_generator.v` | Testbench autoverificable |
 
 ## Memorias
 
@@ -454,7 +509,7 @@ El procesador necesita dos memorias separadas (arquitectura Harvard):
 
 Al estar separadas, la búsqueda de una instrucción (IF) y el acceso a datos (MEM) nunca compiten por el mismo recurso: no hay riesgo estructural.
 
-Como `data_memory` guarda palabras de 32 bits pero RISC-V también accede a bytes y medias palabras, se agregan dos módulos combinacionales auxiliares que adaptan el dato en la entrada (stores) y en la salida (loads).
+Como `data_memory` guarda palabras de 32 bits pero RISC-V también accede a bytes y medias palabras, se agregan dos módulos combinacionales auxiliares que adaptan el dato en la entrada (stores) y en la salida (loads). Un tercer módulo, `data_access_checker`, revisa cada acceso (rango y alineación) antes de que llegue a la memoria.
 
 | Módulo | Rol |
 | --- | --- |
@@ -462,6 +517,7 @@ Como `data_memory` guarda palabras de 32 bits pero RISC-V también accede a byte
 | `data_memory` | Memoria de datos, 1024 × 32 bits, en 4 bancos de byte |
 | `store_data_formatter` | Prepara `sb`/`sh`/`sw`: ubica el dato y decide qué bytes se escriben |
 | `load_data_extender` | Prepara `lb`/`lh`/`lw`/`lbu`/`lhu`: elige el byte/media palabra y extiende signo o ceros |
+| `data_access_checker` | Verifica rango y alineación de cada load/store y señala los accesos fuera de contrato |
 
 ### Parámetros generales
 
@@ -482,10 +538,10 @@ Es una RAM con un puerto de lectura (CPU) y otro de escritura (Debug Unit), que 
 | --- | --- | --- | --- |
 | `i_clk` | in | 1 | Reloj del sistema |
 | `i_read_enable` | in | 1 | Habilita la lectura (`cpu_en && !stall`) |
-| `i_read_addr` | in | 10 | Índice de palabra a leer |
+| `i_read_word_addr` | in | 10 | Índice de palabra a leer |
 | `o_read_data` | out | 32 | Instrucción leída, disponible al ciclo siguiente |
 | `i_write_enable` | in | 1 | Escribe una palabra (Debug Unit, durante la carga) |
-| `i_write_addr` | in | 10 | Índice de palabra a escribir |
+| `i_write_word_addr` | in | 10 | Índice de palabra a escribir |
 | `i_write_data` | in | 32 | Instrucción a guardar |
 
 **Comportamiento**
@@ -522,9 +578,9 @@ Tiene dos puertos:
 
 **Comportamiento**
 
-- `i_write_byte_enable = 4'b0000` significa que no hay escritura. Quien instancie la memoria debe dejarlo en 0 cuando la instrucción no sea válida, la dirección esté fuera de rango o la CPU no avance (`cpu_en = 0`).
+- `i_write_byte_enable = 4'b0000` significa que no hay escritura. Quien instancie la memoria debe dejarlo en 0 cuando la instrucción no sea válida, la dirección esté fuera de rango (lo informa `data_access_checker`) o la CPU no avance (`cpu_en = 0`).
 - Un store escrito en el ciclo MEM es visible para un load que acceda a esa dirección en el ciclo siguiente.
-- La memoria no valida rangos: el chequeo de direcciones fuera de `0x0000_0000–0x0000_0FFF` lo realiza el CPU antes de llegar acá.
+- La memoria no valida rangos: el chequeo de direcciones fuera de `0x0000_0000–0x0000_0FFF` lo realiza `data_access_checker` antes de llegar acá.
 
 ### `store_data_formatter`
 
@@ -546,6 +602,7 @@ Convierte un store en lo que la memoria necesita: **el dato replicado** en los c
 | `sw` | `dato` | `1111` |
 
 Replicar el dato evita usar desplazadores: cada byte de la memoria recibe siempre el mismo carril de entrada y solo se escribe el habilitado. Si `i_funct3` no corresponde a un store válido, no se escribe nada.
+
 ### `load_data_extender`
 
 Toma la palabra leída de la memoria y arma el resultado del load: elige el byte o media palabra según el offset y extiende el valor a 32 bits.
@@ -567,6 +624,31 @@ Toma la palabra leída de la memoria y arma el resultado del load: elige el byte
 
 Un `funct3` no soportado devuelve 0.
 
+### `data_access_checker`
+
+Revisa cada load y store **antes** de que llegue a la memoria. Es puramente combinacional y detecta dos situaciones que el programa no debería producir:
+
+| Situación | Cuándo ocurre | Qué hace el CPU |
+| --- | --- | --- |
+| **Fuera de rango** | La dirección no cae en `0x0000_0000–0x0000_0FFF` (los 4 KiB de la memoria) | El store no se escribe y el load devuelve 0 |
+| **Desalineado** | `lh`/`lhu`/`sh` con dirección impar, o `lw`/`sw` con dirección que no es múltiplo de 4 | El acceso se resuelve alineando hacia abajo (fuera de contrato) |
+
+Cada situación queda registrada en una bandera persistente (`dmem_oob_seen` y `misaligned_seen`, que permanecen en 1 hasta el próximo reset). La Debug Unit las informa en `GET_STATUS`. Así, un error del programa se distingue de un error del hardware: sin la bandera, un acceso desalineado devolvería un dato equivocado sin dejar rastro.
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_access_valid` | in | 1 | Hay un load o store válido en MEM (las burbujas llegan con 0) |
+| `i_funct3` | in | 3 | Tamaño del acceso (byte, media palabra o palabra) |
+| `i_byte_address` | in | 32 | Dirección efectiva en bytes |
+| `o_is_out_of_range` | out | 1 | La dirección está fuera de la memoria |
+| `o_is_misaligned` | out | 1 | La dirección no respeta el tamaño del acceso |
+
+El parámetro `ADDR_WIDTH` (10 por defecto) fija el tamaño de la memoria: el rango válido es de `2^(ADDR_WIDTH+2)` bytes.
+
+#### Verificación (`tb_data_access_checker`)
+
+Recorre los ocho valores de `i_funct3`, con y sin `i_access_valid`, sobre direcciones límite (`0xFFF`, `0x1000`, `0xFFFFFFFF`, …) y direcciones aleatorias. Compara cada salida con un cálculo directo de rango y alineación, y termina con `TODAS LAS PRUEBAS PASARON` si no hay fallos.
+
 ### Cómo se conectan en el pipeline
 
 ```text
@@ -577,14 +659,15 @@ Un `funct3` no soportado devuelve 0.
   addr[11:2] ───────────────────────────────┘   └─ se guarda en MEM/WB ─┘
 ```
 
-1. En **MEM**, el formatter transforma el store y `data_memory` lo escribe; en un load, la memoria devuelve la palabra completa, que se registra en `MEM/WB.mem_raw`.
+1. En **MEM**, `data_access_checker` revisa la dirección y el tamaño del acceso. Si la dirección es válida, el formatter transforma el store y `data_memory` lo escribe; en un load, la memoria devuelve la palabra completa, que se registra en `MEM/WB.mem_raw`.
 2. En **WB**, `load_data_extender` elige el byte/media palabra y extiende, y el resultado se escribe en el banco de registros (o se adelanta por forwarding).
 
 ### Casos definidos
 
 | Caso | Comportamiento |
 | --- | --- |
-| Acceso desalineado (`lh`/`sh` con `addr[0]=1`, `lw`/`sw` con `addr[1:0]≠0`) | Fuera de contrato: se ignoran los bits bajos y se alinea hacia abajo. Sin excepción |
+| Acceso desalineado (`lh`/`sh` con `addr[0]=1`, `lw`/`sw` con `addr[1:0]≠0`) | Fuera de contrato: se ignoran los bits bajos y se alinea hacia abajo. Sin excepción, pero la CPU levanta la bandera `misaligned_seen` |
+| Dirección fuera de `0x0000_0000–0x0000_0FFF` | El store no se escribe y el load devuelve 0. La CPU levanta la bandera `dmem_oob_seen` |
 | `funct3` no soportado | Store sin efecto; load devuelve 0 |
 | Lectura sin `read_enable` | La salida mantiene el último valor leído |
 
@@ -592,11 +675,13 @@ Un `funct3` no soportado devuelve 0.
 
 | Archivo | Contenido |
 | --- | --- |
-| `program_memory.v` | Memoria de programa |
-| `data_memory.v` | Memoria de datos con puertos A y B |
-| `store_data_formatter.v` | Formato de escritura para stores |
-| `load_data_extender.v` | Selección y extensión para loads |
-| `tb_program_memory.v` | Testbench de la memoria de programa |
-| `tb_data_memory.v` | Testbench del subsistema de datos |
+| `src/program_memory.v` | Memoria de programa |
+| `src/data_memory.v` | Memoria de datos con puertos A y B |
+| `src/store_data_formatter.v` | Formato de escritura para stores |
+| `src/load_data_extender.v` | Selección y extensión para loads |
+| `src/data_access_checker.v` | Chequeo de rango y alineación de los accesos |
+| `tests/tb_program_memory.v` | Testbench de la memoria de programa |
+| `tests/tb_data_memory.v` | Testbench del subsistema de datos |
+| `tests/tb_data_access_checker.v` | Testbench del chequeo de accesos |
 
 Dependencia: `riscv_defs.vh` (constantes de `funct3`).

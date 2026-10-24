@@ -4,10 +4,10 @@ module tb_program_memory;
 
     reg         clk = 0;
     reg         read_enable = 0;
-    reg  [9:0]  read_addr = 0;
+    reg  [9:0]  read_word_addr = 0;
     wire [31:0] read_data;
     reg         write_enable = 0;
-    reg  [9:0]  write_addr = 0;
+    reg  [9:0]  write_word_addr = 0;
     reg  [31:0] write_data = 0;
 
     integer error_count = 0;
@@ -16,10 +16,10 @@ module tb_program_memory;
     program_memory dut (
         .i_clk(clk),
         .i_read_enable(read_enable),
-        .i_read_addr(read_addr),
+        .i_read_word_addr(read_word_addr),
         .o_read_data(read_data),
         .i_write_enable(write_enable),
-        .i_write_addr(write_addr),
+        .i_write_word_addr(write_word_addr),
         .i_write_data(write_data)
     );
 
@@ -37,14 +37,14 @@ module tb_program_memory;
 
     task write_word(input [9:0] addr, input [31:0] data);
         begin
-            write_enable = 1; write_addr = addr; write_data = data;
+            write_enable = 1; write_word_addr = addr; write_data = data;
             @(posedge clk); #1 write_enable = 0;
         end
     endtask
 
     task read_word(input [9:0] addr);
         begin
-            read_enable = 1; read_addr = addr;
+            read_enable = 1; read_word_addr = addr;
             @(posedge clk); #1 read_enable = 0;
         end
     endtask
@@ -69,7 +69,7 @@ module tb_program_memory;
         end
 
         // Sin enable la salida se conserva
-        read_addr = 10'd3;
+        read_word_addr = 10'd3;
         @(posedge clk); #1;
         check("sin enable conserva salida", read_data, 32'h1000_000F);
 
@@ -79,15 +79,15 @@ module tb_program_memory;
         check("sobrescritura", read_data, 32'hAAAA5555);
 
         // Lectura y escritura simultanea en la misma direccion: dato viejo
-        read_enable = 1; read_addr = 10'd5;
-        write_enable = 1; write_addr = 10'd5; write_data = 32'h12345678;
+        read_enable = 1; read_word_addr = 10'd5;
+        write_enable = 1; write_word_addr = 10'd5; write_data = 32'h12345678;
         @(posedge clk); #1 read_enable = 0; write_enable = 0;
         check("lectura simultanea devuelve dato viejo", read_data, 32'hAAAA5555);
         read_word(10'd5);
         check("dato nuevo en lectura posterior", read_data, 32'h12345678);
 
         // Escritura sin write_enable no modifica
-        write_enable = 0; write_addr = 10'd6; write_data = 32'hFFFFFFFF;
+        write_enable = 0; write_word_addr = 10'd6; write_data = 32'hFFFFFFFF;
         @(posedge clk); #1;
         read_word(10'd6);
         check("sin write_enable no escribe", read_data, 32'h1000_0006);

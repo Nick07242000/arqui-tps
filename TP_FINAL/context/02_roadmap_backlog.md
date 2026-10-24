@@ -53,7 +53,7 @@ Evitar comenzar a codificar con interfaces ambiguas o dependencias no resueltas.
 - **T0.1.3:** definir anchos de señales, direcciones, latencia de memoria y qué flanco/etapa consume cada dato. 
 - **T0.1.4:** definir convenciones de reset, `valid`, stall, flush, `HALT`, fin de imagen y estado `busy/done/error`. 
 - **T0.1.5:** definir el protocolo de comandos y respuestas UART, incluyendo longitud, errores y límites. 
-- **T0.1.6:** registrar las decisiones adoptadas: memorias de instrucciones y datos separadas, stalls sin forwarding, resolución de branches y jumps en EX, reset de registros y pipeline, persistencia de la memoria de datos, convención HALT, longitud `N_WORDS`, protocolo UART y frecuencia inicial según la plataforma.
+- **T0.1.6:** registrar las decisiones adoptadas: memorias de instrucciones y datos separadas, forwarding desde `EX/MEM` y `MEM/WB` con stall de un ciclo en load-use (alternativa por tiempo: solo stalls), resolución de branches y jumps en EX, reset de registros y pipeline, persistencia de la memoria de datos, convención HALT, longitud `N_WORDS`, protocolo UART y frecuencia inicial según la plataforma.
 
 **Criterios de aceptación / Gate E0** 
 - Existe un diagrama actualizado de arquitectura y un mapa de interfaces. 

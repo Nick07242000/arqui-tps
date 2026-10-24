@@ -63,6 +63,7 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
 └── cpu_core
     ├── pc_control           # PC, next_pc, fetch_stop
     ├── control_unit         # decode de opcode/funct3/funct7 (+ ilegal, HALT)
+    ├── data_access_checker  # rango y alineacion de loads/stores en MEM
     ├── immediate_generator
     ├── register_file        # 32x32, 2R+1W, bypass WB->ID, puerto debug
     ├── forwarding_unit
@@ -335,7 +336,7 @@ Shifts inmediatos: `shamt = imm[4:0]`; la ALU solo usa `B[4:0]` en SLL/SRL/SRA.
 
 Los espacios de código y datos son **independientes** (Harvard): el programa no puede leer ni escribir su propio código, y `.data` no se carga. Los programas deben inicializar con instrucciones (`lui`/`addi`/`sw`) lo que vayan a leer. La herramienta de PC solo transmite `.text`.
 
-Si la herramienta no infiere el puerto B sin duplicar la BRAM, se acepta la duplicación (costo despreciable: ≈ 2 de 46 bloques BSRAM — verificar en datasheet).
+Si la herramienta no infiere el puerto B sin duplicar la BRAM, se acepta la duplicación. Estimación con Yosys (`synth_gowin`): `program_memory` usa 2 bloques BSRAM y `data_memory` 8, ≈ 10 de 46 (verificar con Gowin EDA y datasheet).
 
 ### 4.2 Acceso a datos (byte lanes)
 
@@ -357,7 +358,7 @@ Sin sumadores extra ni *shifters* en MEM:
 
 | Caso | Comportamiento |
 | --- | --- |
-| Acceso desalineado (`lh/sh` con `addr[0]=1`, `lw/sw` con `addr[1:0]≠0`) | **Fuera de contrato**: se alinea hacia abajo (ignora los bits bajos). Sin excepción. |
+| Acceso desalineado (`lh/sh` con `addr[0]=1`, `lw/sw` con `addr[1:0]≠0`) | **Fuera de contrato**: se alinea hacia abajo (ignora los bits bajos). Sin excepción, pero se levanta el flag sticky `misaligned_seen`. |
 | Dirección de datos `addr[31:12] ≠ 0` | Store **suprimido**, load devuelve 0, flag sticky `dmem_oob_seen` |
 | PC con `pc[1:0] ≠ 0` (p. ej. por `jalr`) | Ignora los 2 bits bajos para indexar `imem` |
 | Dirección de fetch ≥ `N_WORDS·4` | No se busca (ver §6.3) |
@@ -392,9 +393,11 @@ El forward ocurre sobre ambos operandos, de modo que **`store_data`, la comparac
 **Stall load-use (detectado en ID):**
 
 ```verilog
-stall = idex.valid && idex.mem_read && idex.rd != 0 &&
+stall = ifid.valid && idex.valid && idex.mem_read && idex.rd != 0 &&
         ((uses_rs1 && ifid_rs1 == idex.rd) || (uses_rs2 && ifid_rs2 == idex.rd));
 ```
+
+**ifid.valid**: hoy el procesador puede frenarse por una instrucción que en realidad ya no existe, porque IF/ID marca “no válido” pero conserva la palabra vieja. Pasa, por ejemplo, si un lw es lo último de un programa sin HALT: la palabra que sigue es un resto de un programa anterior. Esa palabra puede coincidir con el registro del load y causar un ciclo de más, de modo que cycles dependería de basura de memoria. Con ifid.valid solo se frena por instrucciones reales.
 
 Efecto del stall (todo lo demás sigue avanzando):
 
@@ -649,7 +652,7 @@ En una respuesta de error `LEN = 0`.
 | --- | --- | --- |
 | 0 | 1 | `state` (§7.2) |
 | 1 | 1 | `done_reason`: `0` ninguna, `1` HALT, `2` END_OF_IMAGE |
-| 2 | 1 | `flags`: bit0 `prog_valid`, bit1 `halting`, bit2 `illegal_seen`, bit3 `dmem_oob_seen` |
+| 2 | 1 | `flags`: bit0 `prog_valid`, bit1 `halting`, bit2 `illegal_seen`, bit3 `dmem_oob_seen`, bit4 `misaligned_seen` |
 | 3 | 2 | `n_words` |
 | 5 | 4 | `pc` |
 | 9 | 4 | `cycles` (ciclos habilitados desde el último reset) |
@@ -813,7 +816,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | `cpu_done_reason` | `cpu_core` → `debug_unit` | 2 | 1 = HALT, 2 = END_OF_IMAGE |
 | `cpu_halting` | `cpu_core` → `debug_unit` | 1 | HALT confirmado |
 | `cpu_pc` | `cpu_core` → `debug_unit` | 32 | PC actual |
-| `flag_illegal`, `flag_dmem_oob` | `cpu_core` → `debug_unit` | 1+1 | Flags sticky |
+| `flag_illegal`, `flag_dmem_oob`, `flag_misaligned` | `cpu_core` → `debug_unit` | 1+1 | Flags sticky |
 | `cycles`, `retired` | `cpu_core` → `debug_unit` | 32+32 | Contadores |
 | `dbg_reg_idx` | `debug_unit` → `cpu_core` | 5 | Registro a leer |
 | `dbg_reg_data` | `cpu_core` → `debug_unit` | 32 | Valor (lectura combinacional) |
@@ -859,12 +862,12 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-02 | BRAM síncrona; `IF/ID.instr` = salida de BRAM; dirección = `PC` registrado | Lectura asíncrona (LUT-RAM); `next_pc` como dirección | Mapea a BSRAM, camino de `next_pc` fuera de la dirección | `imem_ce` necesario para congelar `IF/ID` |
 | ADR-03 | Forwarding `EX/MEM`+`MEM/WB` y stall de 1 ciclo en load-use; plan B solo-stalls | Solo stalls desde el inicio | Criterio simple pero interesante, cubierto por el roadmap | Mux de 3 entradas en A y B |
 | ADR-04 | Branch/jump en EX, sin predicción, penalización 2 | Resolver en ID; predicción | Simplicidad; fuera de alcance | Flush de IF/ID e ID |
-| ADR-05 | Banco de registros combinacional con bypass WB→ID, FF con reset síncrono | BRAM para registros | Evita forward adicional y permite lectura de debug | ≈ 1024 FF |
+| ADR-05 | Banco de registros combinacional con bypass WB→ID, FF con reset síncrono | BRAM para registros | Evita forward adicional y permite lectura de debug | ≈ 1000 FF y ≈ 4 900 LUT4 (≈ 24 % del chip, estimación Yosys) |
 | ADR-06 | `valid` por latch | Convención NOP | Distingue burbuja de instrucción real | +4 FF |
 | ADR-07 | `HALT` confirmado en EX; `done = fetch_stop && vacío` | Detectar en ID | Evita parar por una instrucción especulativa | HALT recorre el pipeline como instrucción sin efectos |
 | ADR-08 | `END_OF_IMAGE` no sticky, derivado de `PC ≥ N_WORDS` | Flag sticky al leer fuera | Correcto con fetch especulativo | `PC` retenido en fin de imagen |
-| ADR-09 | Ilegales neutralizadas + flag; dmem fuera de rango suprimido + flag | Excepciones/trap | Sin infraestructura de excepciones, pero observable | 2 flags en `GET_STATUS` |
-| ADR-10 | Acceso desalineado fuera de contrato (alinea hacia abajo) | Soporte completo/excepción | Los tests no lo usan | Documentado, no testeado como feature |
+| ADR-09 | Ilegales neutralizadas + acceso desalineado + flag; dmem fuera de rango suprimido + flag | Excepciones/trap | Sin infraestructura de excepciones, pero observable | 3 flags en `GET_STATUS` |
+| ADR-10 | Acceso desalineado fuera de contrato (alinea hacia abajo) | Soporte completo/excepción | Los tests no lo usan | Documentado y señalizado con `misaligned_seen` |
 | ADR-11 | `cpu_en` único para step y run | Reloj gateado | Requisito de la consigna | Todos los FF del CPU llevan CE |
 | ADR-12 | Reloj único 27 MHz sin PLL inicial | PLL desde el inicio | Menos complejidad | Frecuencia se decide en E7 |
 | ADR-13 | Protocolo `[CMD][LEN16][PAYLOAD]` / `[STATUS][LEN16][PAYLOAD]`, sin checksum, con timeout de 100 ms | Checksum, framing con delimitadores | Simple, robusto con timeout | Resincronización por silencio |
