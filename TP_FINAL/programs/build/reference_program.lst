@@ -1,0 +1,71 @@
+
+reference_program.o:     file format elf32-littleriscv
+
+
+Disassembly of section .text:
+
+00000000 <_start>:
+   0:	00a00113          	addi	sp,zero,10
+   4:	00300193          	addi	gp,zero,3
+   8:	00310233          	add	tp,sp,gp
+   c:	403102b3          	sub	t0,sp,gp
+  10:	00317333          	and	t1,sp,gp
+  14:	003163b3          	or	t2,sp,gp
+  18:	00314433          	xor	s0,sp,gp
+  1c:	003114b3          	sll	s1,sp,gp
+  20:	00315533          	srl	a0,sp,gp
+  24:	00a00593          	addi	a1,zero,10
+  28:	00000613          	addi	a2,zero,0
+
+0000002c <loop_sum>:
+  2c:	00058863          	beq	a1,zero,3c <end_sum>
+  30:	00b60633          	add	a2,a2,a1
+  34:	fff58593          	addi	a1,a1,-1
+  38:	ff5ff06f          	jal	zero,2c <loop_sum>
+
+0000003c <end_sum>:
+  3c:	04c02023          	sw	a2,64(zero) # 40 <end_sum+0x4>
+  40:	00000693          	addi	a3,zero,0
+  44:	00100713          	addi	a4,zero,1
+  48:	00000793          	addi	a5,zero,0
+  4c:	00a00813          	addi	a6,zero,10
+
+00000050 <loop_fib>:
+  50:	00d7a023          	sw	a3,0(a5)
+  54:	00e688b3          	add	a7,a3,a4
+  58:	00070693          	addi	a3,a4,0
+  5c:	00088713          	addi	a4,a7,0
+  60:	00478793          	addi	a5,a5,4
+  64:	fff80813          	addi	a6,a6,-1
+  68:	fe0814e3          	bne	a6,zero,50 <loop_fib>
+  6c:	00000913          	addi	s2,zero,0
+  70:	00a00993          	addi	s3,zero,10
+  74:	048000ef          	jal	ra,bc <sum_array>
+  78:	05402223          	sw	s4,68(zero) # 44 <end_sum+0x8>
+  7c:	80ff8b37          	lui	s6,0x80ff8
+  80:	f01b0b13          	addi	s6,s6,-255 # 80ff7f01 <sum_loop+0x80ff7e41>
+  84:	04800c13          	addi	s8,zero,72
+  88:	016c2023          	sw	s6,0(s8)
+  8c:	003c0c83          	lb	s9,3(s8)
+  90:	003c4d03          	lbu	s10,3(s8)
+  94:	002c1d83          	lh	s11,2(s8)
+  98:	002c5e03          	lhu	t3,2(s8)
+  9c:	05500f93          	addi	t6,zero,85
+  a0:	01fc00a3          	sb	t6,1(s8)
+  a4:	000c2f03          	lw	t5,0(s8)
+  a8:	ff000e93          	addi	t4,zero,-16
+  ac:	403edbb3          	sra	s7,t4,gp
+  b0:	01d13c33          	sltu	s8,sp,t4
+  b4:	01d12fb3          	slt	t6,sp,t4
+  b8:	0000000b          	.word	0x0000000b
+
+000000bc <sum_array>:
+  bc:	00000a13          	addi	s4,zero,0
+
+000000c0 <sum_loop>:
+  c0:	00092a83          	lw	s5,0(s2)
+  c4:	015a0a33          	add	s4,s4,s5
+  c8:	00490913          	addi	s2,s2,4
+  cc:	fff98993          	addi	s3,s3,-1
+  d0:	fe0998e3          	bne	s3,zero,c0 <sum_loop>
+  d4:	00008067          	jalr	zero,0(ra)
