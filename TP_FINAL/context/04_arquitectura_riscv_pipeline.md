@@ -399,6 +399,8 @@ stall = ifid.valid && idex.valid && idex.mem_read && idex.rd != 0 &&
 
 **ifid.valid**: hoy el procesador puede frenarse por una instrucción que en realidad ya no existe, porque IF/ID marca “no válido” pero conserva la palabra vieja. Pasa, por ejemplo, si un lw es lo último de un programa sin HALT: la palabra que sigue es un resto de un programa anterior. Esa palabra puede coincidir con el registro del load y causar un ciclo de más, de modo que cycles dependería de basura de memoria. Con ifid.valid solo se frena por instrucciones reales.
 
+> El fix de ifid.valid es cosmético, no un bug. Dije que los ciclos podían depender de basura en imem. Lo medí y no es cierto: sin el fix la señal stall se activa una vez de más, pero los ciclos son idénticos (caso dirigido y 6000 programas). Cuando IF/ID es inválido el frente ya está vacío y el bubble en ID/EX se inserta igual. Es inocuo y puede quedar, pero no lo cuentes como corrección funcional.
+
 Efecto del stall (todo lo demás sigue avanzando):
 
 | Elemento | Durante el stall |
