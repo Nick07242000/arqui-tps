@@ -740,6 +740,7 @@ No forma parte del entregable final. Es una base para validar las instrucciones 
 Esta etapa agrega un módulo:
 
 | Módulo | Archivo | Función |
+| --- | --- | --- |
 | `unpipelined_datapath` | `unpipelined_datapath.v` | Conexión de todos los bloques en un modelo ejecutable |
 
 ### Vista general del datapath
