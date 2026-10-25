@@ -1,5 +1,43 @@
 # CPU RISC-V
 
+## Multiplexor genérico (`mux`)
+
+Un único módulo configurable reemplaza a los multiplexores de cada punto del datapath.
+
+| Parámetro | Descripción |
+| --- | --- |
+| `DATA_WIDTH` | Ancho en bits de cada entrada y de la salida |
+| `INPUT_COUNT` | Cantidad de entradas (mínimo 2) |
+
+| Puerto | Dir | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_inputs` | in | `INPUT_COUNT × DATA_WIDTH` | Todas las entradas concatenadas en un bus |
+| `i_select` | in | `clog2(INPUT_COUNT)` | Índice de la entrada elegida |
+| `o_output` | out | `DATA_WIDTH` | Entrada seleccionada |
+
+**Cómo se arma el bus de entradas.** La entrada 0 ocupa los bits menos significativos y se escribe **última** en la concatenación:
+
+```verilog
+// Mux de 3 entradas: select 0 -> pc_plus_4, 1 -> pc_plus_immediate, 2 -> jalr_target
+.i_inputs ({jalr_target, pc_plus_immediate, pc_plus_4})
+```
+
+Si `i_select` apunta a una entrada que no existe (por ejemplo `3` en un mux de 3 entradas), la salida vale cero en lugar de quedar indefinida.
+
+## Registro genérico (`register`)
+
+Guarda un valor de `DATA_WIDTH` bits en cada flanco de subida del reloj.
+
+| Puerto / parámetro | Descripción |
+| --- | --- |
+| `DATA_WIDTH` | Ancho del registro |
+| `RESET_VALUE` | Valor que toma con el reset (por defecto, cero) |
+| `i_reset` | Reset sincrónico. **Tiene prioridad** sobre `i_enable` |
+| `i_enable` | Si vale 1, el registro carga `i_data` en el flanco de reloj |
+| `i_data` / `o_data` | Dato de entrada y valor almacenado |
+
+Se usa dos veces en el datapath: como **PC** (32 bits, reset en 0) y como **flag de espera de load** (1 bit).
+
 ## ALU (Unidad Aritmético-Lógica)
 
 ### ¿Qué es y para qué sirve?
@@ -690,3 +728,162 @@ Dependencia: `riscv_defs.vh` (constantes de `funct3`).
 
 <img width="2720" height="1904" alt="cpu_pipeline_estado_modulos" src="https://github.com/user-attachments/assets/45812dd3-8750-49a3-b113-5ce157f06a1a" />
 <img width="3179" height="1779" alt="procesador_riscv_milestone1" src="https://github.com/user-attachments/assets/3035f7e4-0ec7-4bcc-97cc-40c3f5d43d03" />
+
+## Datapath no segmentado de referencia
+
+### Qué es y para qué sirve
+
+El datapath no segmentado es una versión simple del procesador que ejecuta **una instrucción por vez**, sin pipeline. Conecta los módulos ya construidos (memoria de programa, decodificador, banco de registros, generador de inmediatos, ALU y memoria de datos) y sirve de **referencia funcional**: si un programa da cierto resultado en este modelo, el pipeline de cinco etapas debe dar exactamente el mismo.
+
+No forma parte del entregable final. Es una base para validar las instrucciones una por una antes de sumar la complejidad de los riesgos del pipeline.
+
+Esta etapa agrega el módulo:
+
+| Módulo | Archivo | Función |
+| `unpipelined_datapath` | `unpipelined_datapath.v` | Conexión de todos los bloques en un modelo ejecutable |
+
+### Vista general del datapath
+
+```mermaid
+flowchart LR
+  PC["PC<br/>(register)"] --> PC4["pc + 4"]
+  PC --> PCI["pc + inmediato"]
+  NPC{{"mux<br/>next_pc"}} --> PC
+  NPC -->|"direccion"| IMEM["program_memory"]
+  IMEM -->|"instruction"| CU["control_unit"]
+  IMEM --> IG["immediate_generator"]
+  IMEM -->|"rs1, rs2"| RF["registers"]
+
+  RF -->|"rs1"| ALU["alu"]
+  RF -->|"rs2"| MB{{"mux<br/>operando B"}}
+  IG -->|"inmediato"| MB
+  MB --> ALU
+  CU -->|"alu_op"| ALU
+
+  RF --> EQ["comparador<br/>rs1 == rs2"]
+  EQ --> NPC
+  PC4 --> NPC
+  PCI --> NPC
+  ALU -->|"jalr"| NPC
+
+  ALU -->|"direccion"| DMEM["data_memory"]
+  RF -->|"rs2 (store)"| SF["store_data_formatter"]
+  SF --> DMEM
+  DMEM --> LE["load_data_extender"]
+
+  ALU --> WB{{"mux<br/>writeback"}}
+  LE --> WB
+  PC4 --> WB
+  WB -->|"rd"| RF
+```
+
+Los rombos redondeados son instancias del `mux` genérico.
+
+### Interfaz del módulo `unpipelined_datapath`
+
+**Parámetro:** `ADDR_WIDTH` (por defecto 10): ancho del índice de palabra de las dos memorias (1024 palabras).
+
+| Grupo | Señal | Dir | Ancho | Descripción |
+| --- | --- | --- | --- | --- |
+| Control | `i_clk` | in | 1 | Reloj único del sistema |
+| | `i_reset` | in | 1 | Reset síncrono: PC en 0, registros en 0 |
+| | `i_cpu_en` | in | 1 | Habilita el avance. Con 0 el modelo queda congelado |
+| Carga de programa | `i_program_write_enable` | in | 1 | Escribe una palabra en la memoria de programa |
+| | `i_program_write_word_addr` | in | `ADDR_WIDTH` | Índice de palabra a escribir |
+| | `i_program_write_data` | in | 32 | Instrucción a guardar |
+| Debug | `i_debug_register_addr` | in | 5 | Registro a consultar |
+| | `o_debug_register_data` | out | 32 | Valor del registro consultado |
+| | `i_debug_data_word_addr` | in | `ADDR_WIDTH` | Palabra de memoria de datos a consultar |
+| | `o_debug_data_word` | out | 32 | Valor de esa palabra |
+| Estado | `o_pc` | out | 32 | PC de la instrucción actual |
+| | `o_instruction` | out | 32 | Instrucción actual |
+| | `o_halted` | out | 1 | La instrucción actual es `HALT` |
+| | `o_instruction_retired` | out | 1 | La instrucción actual termina en este ciclo |
+| | `o_illegal_instruction` | out | 1 | La instrucción actual no pertenece a la ISA soportada |
+| | `o_data_out_of_range` | out | 1 | El acceso a datos actual cae fuera de la memoria |
+| | `o_data_misaligned` | out | 1 | El acceso a datos actual está desalineado |
+
+Los tres indicadores de error describen **la instrucción actual** y no son persistentes. El módulo que los use (por ejemplo, el CPU final) deberá capturarlos si quiere conservarlos.
+
+### Cómo ejecuta una instrucción
+
+Todas las etapas ocurren dentro del mismo ciclo, una a continuación de la otra.
+
+1. **Búsqueda.** El PC indica la instrucción actual, que ya está disponible a la salida de `program_memory`.
+2. **Decodificación.** `control_unit` genera las señales de control. Los campos `rs1`, `rs2`, `rd` y `funct3` se cortan directamente de la instrucción (ver el ADR sobre cableado de campos). `immediate_generator` arma el inmediato.
+3. **Ejecución.** La ALU recibe `rs1` y, como segundo operando, `rs2` o el inmediato según la instrucción. En paralelo, un comparador evalúa si `rs1 == rs2` para los branches.
+4. **Memoria.** Si es un load o un store, la dirección sale de la ALU. `data_access_checker` verifica rango y alineación; `store_data_formatter` y `load_data_extender` adaptan los datos a byte, media palabra o palabra.
+5. **Escritura.** Un multiplexor elige qué se guarda en `rd` y el banco de registros lo escribe al final del ciclo.
+6. **Próximo PC.** Otro multiplexor elige a dónde sigue el programa.
+
+#### Selección del próximo PC
+
+| Instrucción | Próximo PC |
+| --- | --- |
+| Cualquier instrucción común | `pc + 4` |
+| `beq` con registros iguales, `bne` con registros distintos | `pc + inmediato` |
+| `beq`/`bne` sin cumplirse la condición | `pc + 4` |
+| `jal` | `pc + inmediato` |
+| `jalr` | `(rs1 + inmediato)` con el bit 0 en cero, como exige la ISA |
+
+#### Selección del dato que se escribe en `rd`
+
+| Instrucción | Dato escrito |
+| --- | --- |
+| Aritméticas, lógicas, comparaciones, `lui` | Resultado de la ALU |
+| `lb`, `lh`, `lw`, `lbu`, `lhu` | Dato leído de memoria, con extensión de signo o de ceros |
+| `jal`, `jalr` | Dirección de retorno (`pc + 4`) |
+| Stores y branches | Nada (no escriben registro) |
+
+### Temporización: dos decisiones importantes
+
+#### Todas las instrucciones tardan un ciclo, salvo los loads
+
+`data_memory` es una memoria síncrona: recibe la dirección en un flanco de reloj y entrega el dato en el siguiente. Por eso un load necesita **dos ciclos**:
+
+| Ciclo | Qué ocurre | PC | Escritura en `rd` |
+| --- | --- | --- | --- |
+| 1 | Se presenta la dirección a la memoria | Congelado | No |
+| 2 | El dato ya está disponible y se escribe en `rd` | Avanza | Sí |
+
+Un pequeño registro de 1 bit (`load_wait_register`) recuerda si ya pasó el primer ciclo. Los stores no necesitan espera: escriben en el flanco de reloj y la instrucción termina en un ciclo.
+
+#### La memoria de programa se direcciona con el *próximo* PC
+
+La memoria de programa también es síncrona, así que leer con el PC actual entregaría la instrucción un ciclo tarde. Para evitarlo, la dirección de lectura es `next_pc`: en el mismo flanco en que el PC se actualiza, la memoria captura la instrucción correspondiente, y ambos quedan alineados.
+
+Consecuencia sobre el **reset**: mientras `i_reset` está activo, el modelo lee la dirección 0. De ese modo, al terminar el reset el PC vale 0 y la primera instrucción ya está lista.
+
+> **Orden obligatorio al cargar un programa:** primero escribir las instrucciones y **después** aplicar el reset. Si se resetea antes de escribir la palabra 0, la memoria devuelve el valor viejo y la primera instrucción ejecutada sería incorrecta.
+
+### Comportamiento ante casos especiales
+
+| Caso | Comportamiento |
+| --- | --- |
+| `HALT` | El PC y la instrucción se congelan, `o_halted` vale 1 y nada más se ejecuta. Se sale con `i_reset` |
+| `i_cpu_en = 0` | Nada cambia: ni PC, ni registros, ni memorias. Permite el modo paso a paso |
+| Instrucción ilegal | Se neutraliza (no escribe ni salta), el PC avanza y `o_illegal_instruction` se activa |
+| Store fuera de rango | Se suprime: no escribe en memoria. Se activa `o_data_out_of_range` |
+| Load fuera de rango | Devuelve 0. Se activa `o_data_out_of_range` |
+| Acceso desalineado | Se alinea hacia abajo, sin excepción. Se activa `o_data_misaligned` |
+| Escritura en `x0` | Descartada por el banco de registros |
+
+### Qué no hace este modelo (a propósito)
+
+- **No tiene pipeline**: no hay latches, forwarding, stalls ni flushes.
+- **No controla fin de imagen** (`N_WORDS`): se detiene únicamente con `HALT`. El fin de imagen se incorpora en la etapa de HALT y vaciado (US-4.3).
+- **No tiene UART ni Debug Unit**: expone puertos simples (carga de programa y consultas) para que un testbench, y más adelante la Debug Unit, los utilicen.
+
+### Verificación realizada
+
+Se ejecutó una prueba de humo con un programa de 19 palabras que cubre `addi`, `add`, `sw`, `lw`, `beq` tomado, `jal`, `lui`, `jalr`, `sb`, `lb`, `lbu` y `HALT`. Las instrucciones que debían saltarse no modificaron registros, y el modelo terminó en `HALT` tras 19 ciclos con 15 instrucciones completadas (4 loads de 2 ciclos). Los valores finales de registros y memoria coincidieron con el cálculo manual.
+
+Esta prueba es solo una comprobación de que las conexiones son correctas. La verificación instrucción por instrucción corresponde a la tarea T2.1.2.
+
+### Reutilización en el pipeline
+
+El modelo está pensado para que gran parte se traslade al pipeline sin cambios:
+
+- `mux` y `register` se reutilizan en la selección de operandos, el forwarding y los latches.
+- Las decisiones de control (`next_pc_select`, `writeback_select`) y el comparador de branches pasan casi iguales a la etapa EX.
+- Lo que cambia es el control de avance: el `load_wait_register` y el congelamiento por `HALT` se reemplazan por la unidad de riesgos (stall y flush) y por el controlador de HALT.
