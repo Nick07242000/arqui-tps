@@ -685,3 +685,8 @@ Recorre los ocho valores de `i_funct3`, con y sin `i_access_valid`, sobre direcc
 | `tests/tb_data_access_checker.v` | Testbench del chequeo de accesos |
 
 Dependencia: `riscv_defs.vh` (constantes de `funct3`).
+
+## Milestone One - Status
+
+<img width="2720" height="1904" alt="cpu_pipeline_estado_modulos" src="https://github.com/user-attachments/assets/45812dd3-8750-49a3-b113-5ce157f06a1a" />
+<img width="3179" height="1779" alt="procesador_riscv_milestone1" src="https://github.com/user-attachments/assets/3035f7e4-0ec7-4bcc-97cc-40c3f5d43d03" />
