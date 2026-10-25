@@ -737,7 +737,7 @@ El datapath no segmentado es una versión simple del procesador que ejecuta **un
 
 No forma parte del entregable final. Es una base para validar las instrucciones una por una antes de sumar la complejidad de los riesgos del pipeline.
 
-Esta etapa agrega el módulo:
+Esta etapa agrega un módulo:
 
 | Módulo | Archivo | Función |
 | `unpipelined_datapath` | `unpipelined_datapath.v` | Conexión de todos los bloques en un modelo ejecutable |
@@ -868,6 +868,12 @@ Consecuencia sobre el **reset**: mientras `i_reset` está activo, el modelo lee 
 | Acceso desalineado | Se alinea hacia abajo, sin excepción. Se activa `o_data_misaligned` |
 | Escritura en `x0` | Descartada por el banco de registros |
 
+### Banco de registros sin bypass
+
+`registers` incluye un *bypass* que entrega a la lectura el dato que se está escribiendo en el mismo ciclo. Es útil en el pipeline, donde la instrucción que escribe (etapa WB) no es la que lee (etapa ID). En el modelo no segmentado ambas son la **misma instrucción**, y con el bypass activo una instrucción como `addi x1, x1, 5` cerraría un lazo combinacional: el resultado de la ALU alimentaría su propio operando.
+
+Por eso `registers` tiene el parámetro `BYPASS_ENABLE` (1 por defecto, sin cambios para el pipeline) y este modelo lo instancia con 0. Este defecto se detectó al ejecutar los testbenches de la verificación aislada de instrucciones.
+
 ### Qué no hace este modelo (a propósito)
 
 - **No tiene pipeline**: no hay latches, forwarding, stalls ni flushes.
@@ -878,12 +884,11 @@ Consecuencia sobre el **reset**: mientras `i_reset` está activo, el modelo lee 
 
 Se ejecutó una prueba de humo con un programa de 19 palabras que cubre `addi`, `add`, `sw`, `lw`, `beq` tomado, `jal`, `lui`, `jalr`, `sb`, `lb`, `lbu` y `HALT`. Las instrucciones que debían saltarse no modificaron registros, y el modelo terminó en `HALT` tras 19 ciclos con 15 instrucciones completadas (4 loads de 2 ciclos). Los valores finales de registros y memoria coincidieron con el cálculo manual.
 
-Esta prueba es solo una comprobación de que las conexiones son correctas. La verificación instrucción por instrucción corresponde a la tarea T2.1.2.
+Esta prueba es solo una comprobación de que las conexiones son correctas. La verificación instrucción por instrucción se documenta en la sección de verificación aislada de instrucciones.
 
 ### Reutilización en el pipeline
 
 El modelo está pensado para que gran parte se traslade al pipeline sin cambios:
 
-- `mux` y `register` se reutilizan en la selección de operandos, el forwarding y los latches.
 - Las decisiones de control (`next_pc_select`, `writeback_select`) y el comparador de branches pasan casi iguales a la etapa EX.
 - Lo que cambia es el control de avance: el `load_wait_register` y el congelamiento por `HALT` se reemplazan por la unidad de riesgos (stall y flush) y por el controlador de HALT.

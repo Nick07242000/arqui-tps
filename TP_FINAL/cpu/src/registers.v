@@ -4,9 +4,10 @@
 // Banco de registros RISC-V: 32 registros de 32 bits.
 // -----------------------------------------------------------------------------
 module registers #(
-    parameter DATA_WIDTH = 32,
-    parameter ADDR_WIDTH = 5,
-    parameter REG_COUNT  = 32
+    parameter DATA_WIDTH    = 32,
+    parameter ADDR_WIDTH    = 5,
+    parameter REG_COUNT     = 32,
+    parameter BYPASS_ENABLE = 1
 ) (
     input  wire                    i_clk,
     input  wire                    i_reset,            // reset sincrono (cpu_rst)
@@ -60,8 +61,8 @@ module registers #(
     wire read_a_is_zero_reg = (i_read_addr_a == ZERO_REG_ADDR);
     wire read_b_is_zero_reg = (i_read_addr_b == ZERO_REG_ADDR);
 
-    wire bypass_a = write_is_effective && (i_write_addr == i_read_addr_a);
-    wire bypass_b = write_is_effective && (i_write_addr == i_read_addr_b);
+    wire bypass_a = BYPASS_ENABLE && write_is_effective && (i_write_addr == i_read_addr_a);
+    wire bypass_b = BYPASS_ENABLE && write_is_effective && (i_write_addr == i_read_addr_b);
 
     assign o_read_data_a = read_a_is_zero_reg ? {DATA_WIDTH{1'b0}} :
                            bypass_a           ? i_write_data       :

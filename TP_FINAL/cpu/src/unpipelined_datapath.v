@@ -144,7 +144,7 @@ module unpipelined_datapath #(
     wire [31:0] rs2_data;
     wire [31:0] writeback_data;
 
-    registers register_file (
+    registers #(.BYPASS_ENABLE(0)) register_file (
         .i_clk             (i_clk),
         .i_reset           (i_reset),
         .i_cpu_en          (i_cpu_en),
