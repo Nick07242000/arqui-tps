@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-module tb_register_file;
+module tb_registers;
 
     localparam DATA_WIDTH = 32;
     localparam ADDR_WIDTH = 5;
@@ -22,10 +22,11 @@ module tb_register_file;
     reg  [ADDR_WIDTH-1:0]  debug_read_addr;
     wire [DATA_WIDTH-1:0]  debug_read_data;
 
-    register_file #(
+    registers #(
         .DATA_WIDTH(DATA_WIDTH),
         .ADDR_WIDTH(ADDR_WIDTH),
-        .REG_COUNT (REG_COUNT)
+        .REG_COUNT (REG_COUNT),
+        .BYPASS_ENABLE(0)
     ) dut (
         .i_clk             (clk),
         .i_reset           (reset),
