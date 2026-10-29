@@ -190,7 +190,7 @@ class ReferenceCpu:
                  f"out_of_range={int(self.seen_out_of_range)} "
                  f"misaligned={int(self.seen_misaligned)}"]
         lines += [f"REG {i} {value:08x}" for i, value in enumerate(self.regs)]
-        lines += [f"MEM {i} {self.read_data_word(i):08x}" for i in range(DATA_WORDS)]
+        lines += [f"MEM {i} {self.read_data_word(i):08x}" for i in range(32)]
         return lines
 
 
