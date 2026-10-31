@@ -7,6 +7,7 @@ module register_id_ex (
     input  wire        i_clk,
     input  wire        i_reset,          // reset sincrono: deja el latch vacio
     input  wire        i_enable,         // captura solo cuando el CPU avanza
+    input  wire        i_insert_bubble,  // en vez de capturar, deja una burbuja
 
     // ---- Identificacion de la instruccion -----------------------------------
     input  wire        i_valid,
@@ -58,8 +59,11 @@ module register_id_ex (
     output reg  [2:0]  o_funct3
 );
 
+    // La burbuja deja el latch igual que el reset, pero solo si el CPU avanza
+    wire clear_latch = i_reset || (i_enable && i_insert_bubble);
+
     always @(posedge i_clk) begin
-        if (i_reset) begin
+        if (clear_latch) begin
             o_valid            <= 1'b0;
             o_pc               <= 32'b0;
             o_instruction      <= 32'b0;

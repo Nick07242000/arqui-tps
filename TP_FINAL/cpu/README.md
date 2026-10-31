@@ -1098,3 +1098,173 @@ vvp cpu_core_tb
 | `cpu_core` ya expone `i_debug_reg_addr` / `o_debug_reg_data` | Reutiliza el puerto de debug del banco de registros y deja lista la consulta de `GET_REGS` | Ninguna |
 
 Algunas salidas quedan sin conectar a propósito hasta que exista su consumidor: `o_uses_rs1`/`o_uses_rs2` del decodificador (US-3.2) y `o_is_misaligned` del chequeo de accesos (E5). La síntesis elimina los campos `pc` e `instruction` de los latches mientras nadie los lea; reaparecerán al conectar el snapshot de depuración, y conviene medir recursos y timing recién después.
+
+## Riesgos de Datos y Forwarding
+
+### Qué problema resuelve
+
+En un pipeline varias instrucciones están en vuelo al mismo tiempo. Si una instrucción necesita el resultado de otra que todavía no terminó, lee un valor viejo del banco de registros:
+
+```text
+add x5, x1, x2      # escribe x5 recién en la etapa WB
+sub x6, x5, x3      # ya está en EX y necesita x5 ahora
+```
+
+Este bloque garantiza que cada instrucción siempre trabaje con el valor más reciente de sus operandos, usando dos mecanismos:
+
+| Mecanismo | Idea | Costo en ciclos |
+| --- | --- | --- |
+| **Forwarding** | Llevar el resultado directamente desde una etapa posterior hasta la entrada de la ALU, sin esperar a que se escriba en el banco | 0 |
+| **Stall** | Detener la instrucción dependiente un ciclo cuando el dato todavía no existe (caso *load-use*) | 1 |
+
+### Cómo se resuelve cada distancia de dependencia
+
+La "distancia" es cuántas instrucciones separan al productor del consumidor. Cada una se resuelve en un lugar distinto:
+
+| Productor respecto del consumidor | Dónde está el dato | Mecanismo |
+| --- | --- | --- |
+| Instrucción inmediatamente anterior (distancia 1) | Latch `EX/MEM` | Forwarding `EX/MEM` → EX |
+| Dos instrucciones antes (distancia 2) | Latch `MEM/WB` | Forwarding `MEM/WB` → EX |
+| Tres instrucciones antes (distancia 3) | Se está escribiendo en el banco | Bypass dentro del banco de registros (ya existente) |
+| Un `load` inmediatamente anterior | Todavía en la memoria de datos | **Stall de 1 ciclo** + forwarding `MEM/WB` |
+
+### Forwarding hacia EX
+
+Cada operando de la etapa EX (`rs1` y `rs2`) pasa por un multiplexor de tres entradas. La `forwarding_unit` decide cuál usar:
+
+```mermaid
+flowchart LR
+  MUX{{"mux de operando<br/>(uno para rs1 y otro para rs2)"}}
+  IDEX["Latch ID/EX<br/>valor leído en ID"] --> MUX
+  EXMEM["Latch EX/MEM<br/>resultado de la instrucción en MEM"] --> MUX
+  WB["Etapa WB<br/>dato final a escribir"] --> MUX
+  FU["forwarding_unit"] -.->|"selección"| MUX
+  MUX --> USE["ALU y dato de store"]
+```
+
+| Selección | Constante | Fuente del operando |
+| --- | --- | --- |
+| `00` | `FORWARD_NONE` | Valor leído en ID (no hay dependencia) |
+| `01` | `FORWARD_FROM_EX_MEM` | Resultado de la instrucción que está en MEM |
+| `10` | `FORWARD_FROM_MEM_WB` | Dato final de la instrucción que está en WB (ya con extensión de signo si fue un load) |
+
+**Reglas que aplica la `forwarding_unit`:**
+
+- Solo adelanta desde una instrucción **válida** que **escribe un registro**. Una burbuja o una instrucción como `sw` o `beq` nunca se adelantan.
+- **Nunca adelanta el registro `x0`**, que siempre vale cero.
+- **No adelanta desde `EX/MEM` si esa instrucción es un `load`**: en ese momento el campo `result` es solo la dirección, el dato todavía no se leyó.
+- Si `EX/MEM` y `MEM/WB` escriben el mismo registro, **gana `EX/MEM`** porque es la instrucción más reciente.
+- El forwarding se aplica a ambos operandos, por lo que también alcanza al **dato de un store** y a los operandos que usarán los saltos en la US-3.3.
+
+**Interfaz de `forwarding_unit`**
+
+| Señal | Dirección | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_id_ex_rs1_addr`, `i_id_ex_rs2_addr` | in | 5 | Registros fuente de la instrucción en EX |
+| `i_ex_mem_valid`, `i_ex_mem_reg_write`, `i_ex_mem_mem_read`, `i_ex_mem_rd_addr` | in | 1, 1, 1, 5 | Instrucción en MEM: validez, escribe registro, es load, destino |
+| `i_mem_wb_valid`, `i_mem_wb_reg_write`, `i_mem_wb_rd_addr` | in | 1, 1, 5 | Instrucción en WB: validez, escribe registro, destino |
+| `o_forward_a_select` | out | 2 | Selección para el operando `rs1` |
+| `o_forward_b_select` | out | 2 | Selección para el operando `rs2` |
+
+### Stall por dependencia load-use
+
+Un `load` obtiene su dato recién al final de la etapa MEM, demasiado tarde para que la instrucción siguiente lo use en EX. Ningún forwarding puede resolverlo sin esperar, así que el pipeline se detiene un ciclo.
+
+```text
+lw  x2, 0(x0)       # el dato aparece al final de MEM
+add x3, x2, x2      # lo necesita al comienzo de EX → debe esperar 1 ciclo
+```
+
+El `hazard_unit` observa la instrucción que está en ID y la que está en EX. Genera `stall` cuando se cumplen todas estas condiciones:
+
+1. La instrucción en ID es válida.
+2. La instrucción en EX es un `load` válido con destino distinto de `x0`.
+3. Algún registro fuente **realmente usado** por la instrucción en ID coincide con el destino del load.
+
+El punto 3 se apoya en las señales `uses_rs1` y `uses_rs2` del decodificador. Evitan stalls falsos cuando los bits que coinciden pertenecen a un inmediato y no a un registro, por ejemplo `addi x3, x0, 2`, cuyos bits `[24:20]` valen 2 pero no son un `rs2`.
+
+**Qué pasa durante el stall**
+
+| Elemento | Comportamiento |
+| --- | --- |
+| `PC` | Congelado |
+| Lectura de la memoria de programa | Congelada: su registro de salida conserva la instrucción de ID |
+| Latch `IF/ID` | Congelado: la instrucción dependiente se repite en ID |
+| Latch `ID/EX` | Recibe una **burbuja** (queda vacío) |
+| `EX/MEM`, `MEM/WB` y la memoria de datos | Siguen avanzando con normalidad |
+
+Como las etapas posteriores siguen avanzando, el `load` completa su recorrido mientras la instrucción dependiente espera. Ninguna instrucción se pierde ni se ejecuta dos veces.
+
+**Interfaz de `hazard_unit`**
+
+| Señal | Dirección | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_if_id_valid` | in | 1 | Hay una instrucción válida en ID |
+| `i_id_rs1_addr`, `i_id_rs2_addr` | in | 5 | Registros fuente de la instrucción en ID |
+| `i_id_uses_rs1`, `i_id_uses_rs2` | in | 1 | Si cada campo es una fuente real |
+| `i_id_ex_valid`, `i_id_ex_mem_read`, `i_id_ex_rd_addr` | in | 1, 1, 5 | Instrucción en EX: validez, es load, destino |
+| `o_stall` | out | 1 | Detener PC e `IF/ID`, insertar burbuja en `ID/EX` |
+
+### Ejemplo de load-use ciclo a ciclo
+
+Programa: `lw x2, 0(x0)` seguido de `add x3, x2, x2`. Traza obtenida de la simulación:
+
+| Ciclo | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `lw` | IF | ID | EX | MEM | WB | | |
+| `add` | | IF | ID *(stall detectado)* | ID *(repite)* | **EX** | MEM | WB |
+| Latch `ID/EX` | | | `lw` | burbuja | `add` | | |
+| Selección en EX | | | | | `10` en ambos operandos | | |
+
+En el ciclo 5 el `lw` está en WB y el `add` en EX: ambos operandos salen del dato final del load (`FORWARD_FROM_MEM_WB`).
+
+### Cambios sobre los módulos existentes
+
+| Módulo | Cambio |
+| --- | --- |
+| `register_id_ex` | Nueva entrada `i_insert_bubble`: si el CPU avanza, el latch se limpia igual que con reset en vez de capturar |
+| `cpu_core` | Nueva sección **Riesgos de datos** con `hazard_unit` y `forwarding_unit`; dos multiplexores de 3 entradas delante de la ALU; el dato del store sale del `rs2` ya adelantado; PC, lectura de `imem` e `IF/ID` usan `front_end_enable = i_cpu_en && !load_use_stall` |
+| `control_unit` | Sin cambios: sus salidas `o_uses_rs1` y `o_uses_rs2`, que estaban sin conectar, ahora alimentan a `hazard_unit` |
+
+Archivos nuevos: `forwarding_unit.v`, `hazard_unit.v` y `forwarding_defs.vh` (constantes de selección, mismo estilo que `alu_ops.vh`).
+
+### Decisiones de diseño
+
+| Decisión | Alternativa descartada | Motivo |
+| --- | --- | --- |
+| Forwarding y detección de stall en dos módulos separados | Un único módulo de riesgos | Cada uno tiene una responsabilidad clara y se prueba por separado |
+| El stall se logra con *enables*, sin tocar el reloj | Detener o filtrar el clock | Requisito de la consigna: el clock no se interviene |
+| El forwarding compara solo los números de registro, sin `uses_rs` | Hacer viajar `uses_rs1/2` por los latches | Si el campo no es una fuente, el valor adelantado se ignora; solo el stall necesita `uses_rs` para no frenar de más |
+| La burbuja limpia **todo** el latch `ID/EX` | Limpiar solo `valid` y los controles | Coincide con la política de reset; una burbuja se ve en debug como una etapa vacía |
+| La sección de riesgos va al final de `cpu_core` | Un bloque por etapa | Observa varias etapas a la vez; sus salidas se declaran arriba, igual que las señales de WB |
+| Guardas defensivas (`!mem_read` en forwarding, `if_id_valid` en stall) | Omitirlas | La primera cumple la tarea T3.2.3; la segunda evita un stall espurio cuando `IF/ID` guarda basura de memoria. Ninguna cambia el comportamiento observable en ejecución normal |
+
+### Verificación
+
+Resultados de simulación con Icarus Verilog: **todos los casos pasan** en los tres testbenches.
+
+| Testbench | Casos | Qué demuestra |
+| --- | --- | --- |
+| `forwarding_unit_tb` | 13 | Cada fuente, prioridad `EX/MEM` sobre `MEM/WB`, y los casos que **no** deben adelantarse: burbuja, sin escritura de registro, `x0` y load en `EX/MEM` |
+| `hazard_unit_tb` | 10 | Dependencia por `rs1`, por `rs2` y por ambos; y los casos que **no** deben frenar: no es load, otro registro, load a `x0`, campo que no es fuente, `IF/ID` inválido y burbuja |
+| `cpu_core_data_hazards_tb` | 15 | Programas completos sobre el pipeline (tabla siguiente) |
+
+Cada test de integración compara registros, memoria y tres contadores: **stalls**, **escrituras de registro** y **stores**. Los dos últimos demuestran que ni forwarding ni stall duplican ni pierden efectos (tarea T3.2.7).
+
+| Programa de prueba | Resultado esperado |
+| --- | --- |
+| Productor a distancia 1 y 2 en una misma instrucción | Valores correctos, 0 stalls |
+| Productor a distancia 3 (bypass del banco) | Valor correcto, 0 stalls |
+| Cadena `x1 = x1 + x1` repetida 4 veces | `x1 = 16`, 0 stalls |
+| Tres escrituras seguidas a `x1` y un consumidor | Usa la más reciente (`x1 = 3`) |
+| Escritura a `x0` y lecturas posteriores | `x0 = 0`, nada se adelanta desde `x0` |
+| Store con dirección base y dato adelantados | Memoria correcta, 1 store |
+| Load-use por `rs1` y por `rs2` (con `sub` para fijar el orden) | 1 stall, resultado correcto |
+| Store cuyo dato viene de un load | 1 stall, **2** stores en total (sin duplicar) |
+| Load con consumidor a distancia 2 | 0 stalls, forwarding desde `MEM/WB` |
+| `lw` seguido de `addi` cuyo campo `[24:20]` coincide con el destino | 0 stalls |
+| Load cuya dirección base viene de otro load | 1 stall, dato correcto |
+| Stall seguido de forwarding y bypass del banco | 1 stall, 3 valores correctos |
+| `lb` y `lbu` con consumidor inmediato | 2 stalls, extensión de signo y de ceros correctas |
+
+**Validación de los tests.** Para comprobar que los tests detectan errores y no solo "pasan", se probaron 12 versiones del diseño con una falla introducida a propósito: sin forwarding desde `EX/MEM`, sin forwarding desde `MEM/WB`, prioridad invertida, forwarding de `x0`, sin stall, stall que ignora `uses_rs`, store sin forwarding, stall que no congela el PC, stall que no congela la memoria de programa, stall sin burbuja, sin la guarda de load y sin la guarda de `IF/ID` válido. **Los 12 fueron detectados** por al menos un test.

@@ -156,3 +156,157 @@ El sistema de depuración requiere leer el contenido de los registros de propós
 ### Consecuencias
 
 * Ninguna.
+
+## ADR - Separación de la unidad de riesgos
+
+### Contexto
+
+Para manejar las dependencias de datos y de control en el pipeline, es necesario implementar lógica que detecte riesgos (hazards) y los resuelva mediante adelantamiento de datos (forwarding) o detención del cauce (stall).
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Implementar un único módulo de riesgos que centralice todas las decisiones. |
+| **A** | **Implementar el forwarding y la detección de stall en dos módulos separados.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+* Cada módulo tiene una responsabilidad clara, lo que permite que se puedan aislar y probar por separado mediante sus propios testbenches.
+
+### Consecuencias
+
+* El diseño jerárquico es más limpio y facilita la depuración de la lógica de resolución de dependencias.
+
+## ADR - Mecanismo de Stall
+
+### Contexto
+
+Cuando se detecta un riesgo de datos insalvable (por ejemplo, un *Load-Use hazard*), las etapas iniciales del pipeline deben congelar su estado para dar tiempo a que el dato esté disponible.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Detener o filtrar la señal de reloj (clock gating) para las etapas afectadas. |
+| **A** | **El stall se logra utilizando señales de *enable* en los registros, sin tocar el reloj.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+* Es un requisito estricto de la consigna: la red de distribución de reloj (clock tree) no se debe intervenir.
+
+### Consecuencias
+
+* Se evitan problemas de sincronismo, *glitches* y violaciones de timing que suelen ocurrir al manipular el reloj en FPGAs.
+
+## ADR - Lógica de comparación en el Forwarding
+
+### Contexto
+
+La unidad de adelantamiento debe comparar las direcciones de los registros destino de las etapas avanzadas con las direcciones de los registros fuente de la etapa de ejecución para inyectar los datos más recientes.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Hacer viajar las banderas `uses_rs1` y `uses_rs2` por los latches para validar que la instrucción destino realmente lee ese registro. |
+| **A** | **El forwarding compara solo los números de registro, ignorando la señal `uses_rs`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+* Si el campo comparado no es realmente una fuente para la instrucción actual, el multiplexor adelantará un valor que simplemente será ignorado por el datapath.
+* A diferencia del forwarding, la lógica de stall sí requiere comprobar `uses_rs` para evitar frenar el pipeline innecesariamente.
+
+### Consecuencias
+
+* Se reduce el tamaño de los latches intermedios y se simplifica la lógica combinacional del módulo de forwarding.
+
+## ADR - Limpieza del latch al insertar una burbuja
+
+### Contexto
+
+Cuando es necesario anular una instrucción en el cauce (por ejemplo, al insertar un stall o vaciar el pipeline por un salto), se debe introducir una "burbuja" en el registro intermedio (ej. `ID/EX`).
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Limpiar únicamente el bit `valid` y poner en cero las señales de control de memoria y escritura. |
+| **A** | **La burbuja limpia todos los campos del latch `ID/EX` por completo.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+* Coincide con la política definida para el reset de los latches.
+* Una burbuja se visualiza en las herramientas de depuración (debug) como una etapa completamente vacía y en ceros, facilitando su interpretación.
+
+### Consecuencias
+
+* Consume levemente más lógica de ruteo para poner a cero los datos de los registros de propósito general y los inmediatos, pero mejora sustancialmente la experiencia de depuración.
+
+## ADR - Ubicación de la sección de riesgos en el Top-Level
+
+### Contexto
+
+La lógica de riesgos interconecta múltiples etapas del procesador, tomando señales de IF, ID, EX, MEM y WB, lo que requiere definir dónde instanciar estos módulos dentro del código del núcleo.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Intercalar la lógica en un bloque dedicado dentro del código de cada etapa. |
+| **A** | **Ubicar la sección de riesgos de forma unificada al final del módulo `cpu_core`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+* Como esta lógica observa varias etapas del datapath a la vez de forma transversal, agruparla al final tiene más sentido conceptual. Sus salidas se declaran al principio del archivo, aplicando la misma convención utilizada para el lazo de realimentación de la etapa WB.
+
+### Consecuencias
+
+* El flujo natural de las etapas IF hasta WB en el código RTL se mantiene lineal e ininterrumpido.
+
+## ADR - Guardas defensivas en la lógica de riesgos
+
+### Contexto
+
+Durante ciclos irregulares (como el arranque) o frente a combinaciones particulares de instrucciones, la lógica de riesgos podría tomar decisiones anómalas a partir de datos inválidos en los latches.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Omitir comprobaciones adicionales, asumiendo que el control de validez estándar filtrará cualquier efecto adverso final. |
+| **A** | **Agregar guardas defensivas explícitas (`!mem_read` en forwarding, `if_id_valid` en stall).** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+* La condición de evitar el forwarding si la instrucción fuente es una lectura a memoria (`!mem_read`) cumple explícitamente con la tarea T3.2.3 de la especificación.
+* La guarda `if_id_valid` evita generar un stall espurio cuando el latch `IF/ID` contiene basura (por ejemplo, ceros o restos de memoria) al estar inactivo.
+* Ninguna de estas condiciones altera el comportamiento observable del procesador en su ejecución normal.
+
+### Consecuencias
+
+* Prevención de interbloqueos (deadlocks) en el arranque o comportamientos indefinidos transitorios.

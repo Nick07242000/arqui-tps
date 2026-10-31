@@ -32,6 +32,11 @@ module cpu_core #(
     wire [4:0]  wb_register_write_addr;
     wire [31:0] wb_register_write_data;
 
+    // Resultado de Riesgos de datos, consumido por IF, ID y EX
+    wire        load_use_stall;
+    wire [1:0]  ex_forward_a_select;
+    wire [1:0]  ex_forward_b_select;
+
 
     // =========================================================================
     // IF - Instruction Fetch
@@ -40,15 +45,18 @@ module cpu_core #(
     wire [31:0] if_pc_plus_4 = if_pc + 32'd4;
     wire        if_is_valid  = 1'b1;       // US-4.3: dependera del fin de la imagen
 
+    // En un stall se congelan PC, lectura de imem e IF/ID; el resto avanza
+    wire        front_end_enable = i_cpu_en && !load_use_stall;
+
     register #(.DATA_WIDTH(32)) program_counter (
         .i_clk    (i_clk),
         .i_reset  (i_cpu_reset),
-        .i_enable (i_cpu_en),
+        .i_enable (front_end_enable),
         .i_data   (if_pc_plus_4),
         .o_data   (if_pc)
     );
 
-    assign o_imem_read_enable = i_cpu_en;
+    assign o_imem_read_enable = front_end_enable;
     assign o_imem_word_addr   = if_pc[MEM_ADDR_WIDTH+1:2];
 
     // ---- Latch IF/ID --------------------------------------------------------
@@ -59,7 +67,7 @@ module cpu_core #(
     register_if_id if_id_latch (
         .i_clk    (i_clk),
         .i_reset  (i_cpu_reset),
-        .i_enable (i_cpu_en),
+        .i_enable (front_end_enable),
         .i_valid  (if_is_valid),
         .i_pc     (if_pc),
         .o_valid  (if_id_valid),
@@ -86,6 +94,8 @@ module cpu_core #(
     wire        id_is_jalr;
     wire        id_is_halt;
     wire        id_is_illegal;
+    wire        id_uses_rs1;
+    wire        id_uses_rs2;
 
     control_unit instruction_decoder (
         .i_instruction      (if_id_instruction),
@@ -100,8 +110,8 @@ module cpu_core #(
         .o_is_jalr          (id_is_jalr),
         .o_is_halt          (id_is_halt),
         .o_is_illegal       (id_is_illegal),
-        .o_uses_rs1         (),            // US-3.2: deteccion de load-use
-        .o_uses_rs2         ()
+        .o_uses_rs1         (id_uses_rs1),
+        .o_uses_rs2         (id_uses_rs2)
     );
 
     wire [31:0] id_immediate;
@@ -156,6 +166,7 @@ module cpu_core #(
         .i_clk              (i_clk),
         .i_reset            (i_cpu_reset),
         .i_enable           (i_cpu_en),
+        .i_insert_bubble    (load_use_stall),
         .i_valid            (if_id_valid),
         .i_pc               (if_id_pc),
         .i_instruction      (if_id_instruction),
@@ -202,6 +213,36 @@ module cpu_core #(
     // =========================================================================
     // EX - Execute
     // =========================================================================
+    // Salidas del latch EX/MEM: se declaran aca porque el forwarding las usa
+    wire        ex_mem_valid;
+    wire [31:0] ex_mem_pc;
+    wire [31:0] ex_mem_instruction;
+    wire [31:0] ex_mem_result;
+    wire [31:0] ex_mem_store_data;
+    wire [4:0]  ex_mem_rd_addr;
+    wire        ex_mem_reg_write;
+    wire        ex_mem_mem_read;
+    wire        ex_mem_mem_write;
+    wire [2:0]  ex_mem_funct3;
+
+    // ---- Operandos con forwarding -------------------------------------------
+    // Entradas en el orden de forwarding_defs.vh: ID/EX, EX/MEM, WB
+    wire [31:0] ex_rs1_value;
+    wire [31:0] ex_rs2_value;
+
+    mux #(.DATA_WIDTH(32), .INPUT_COUNT(3)) forward_rs1_mux (
+        .i_inputs ({wb_register_write_data, ex_mem_result, id_ex_rs1_value}),
+        .i_select (ex_forward_a_select),
+        .o_output (ex_rs1_value)
+    );
+
+    mux #(.DATA_WIDTH(32), .INPUT_COUNT(3)) forward_rs2_mux (
+        .i_inputs ({wb_register_write_data, ex_mem_result, id_ex_rs2_value}),
+        .i_select (ex_forward_b_select),
+        .o_output (ex_rs2_value)
+    );
+
+    // ---- ALU ----------------------------------------------------------------
     wire [31:0] ex_alu_operand_b;
     wire [31:0] ex_alu_result;
     wire [31:0] ex_return_address = id_ex_pc + 32'd4;
@@ -209,13 +250,13 @@ module cpu_core #(
     wire [31:0] ex_result;
 
     mux #(.DATA_WIDTH(32), .INPUT_COUNT(2)) alu_operand_b_mux (
-        .i_inputs ({id_ex_immediate, id_ex_rs2_value}),
+        .i_inputs ({id_ex_immediate, ex_rs2_value}),
         .i_select (id_ex_alu_src_b_is_imm),
         .o_output (ex_alu_operand_b)
     );
 
     alu main_alu (
-        .i_operand_a (id_ex_rs1_value),
+        .i_operand_a (ex_rs1_value),
         .i_operand_b (ex_alu_operand_b),
         .i_alu_op    (id_ex_alu_op),
         .o_result    (ex_alu_result)
@@ -228,17 +269,6 @@ module cpu_core #(
     );
 
     // ---- Latch EX/MEM -------------------------------------------------------
-    wire        ex_mem_valid;
-    wire [31:0] ex_mem_pc;
-    wire [31:0] ex_mem_instruction;
-    wire [31:0] ex_mem_result;
-    wire [31:0] ex_mem_store_data;
-    wire [4:0]  ex_mem_rd_addr;
-    wire        ex_mem_reg_write;
-    wire        ex_mem_mem_read;
-    wire        ex_mem_mem_write;
-    wire [2:0]  ex_mem_funct3;
-
     register_ex_mem ex_mem_latch (
         .i_clk         (i_clk),
         .i_reset       (i_cpu_reset),
@@ -247,7 +277,7 @@ module cpu_core #(
         .i_pc          (id_ex_pc),
         .i_instruction (id_ex_instruction),
         .i_result      (ex_result),
-        .i_store_data  (id_ex_rs2_value),
+        .i_store_data  (ex_rs2_value),
         .i_rd_addr     (id_ex_rd_addr),
         .i_reg_write   (id_ex_reg_write),
         .i_mem_read    (id_ex_mem_read),
@@ -358,5 +388,35 @@ module cpu_core #(
 
     assign wb_register_write_enable = mem_wb_valid && mem_wb_reg_write;
     assign wb_register_write_addr   = mem_wb_rd_addr;
+
+
+    // =========================================================================
+    // Riesgos de datos
+    // =========================================================================
+    hazard_unit hazard_detector (
+        .i_if_id_valid    (if_id_valid),
+        .i_id_rs1_addr    (id_rs1_addr),
+        .i_id_rs2_addr    (id_rs2_addr),
+        .i_id_uses_rs1    (id_uses_rs1),
+        .i_id_uses_rs2    (id_uses_rs2),
+        .i_id_ex_valid    (id_ex_valid),
+        .i_id_ex_mem_read (id_ex_mem_read),
+        .i_id_ex_rd_addr  (id_ex_rd_addr),
+        .o_stall          (load_use_stall)
+    );
+
+    forwarding_unit forwarding_selector (
+        .i_id_ex_rs1_addr   (id_ex_rs1_addr),
+        .i_id_ex_rs2_addr   (id_ex_rs2_addr),
+        .i_ex_mem_valid     (ex_mem_valid),
+        .i_ex_mem_reg_write (ex_mem_reg_write),
+        .i_ex_mem_mem_read  (ex_mem_mem_read),
+        .i_ex_mem_rd_addr   (ex_mem_rd_addr),
+        .i_mem_wb_valid     (mem_wb_valid),
+        .i_mem_wb_reg_write (mem_wb_reg_write),
+        .i_mem_wb_rd_addr   (mem_wb_rd_addr),
+        .o_forward_a_select (ex_forward_a_select),
+        .o_forward_b_select (ex_forward_b_select)
+    );
 
 endmodule
