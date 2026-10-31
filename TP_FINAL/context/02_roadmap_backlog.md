@@ -29,7 +29,7 @@ elección, motivo y consecuencias.
 | `immediate_generator` | Extraer/reconstruir y extender inmediatos de los formatos requeridos. | Decodificar la operación completa. |
 | `control_unit` | Decodificar instrucciones y generar señales de control. | Transportar señales a una etapa incorrecta; los controles deben viajar con la instrucción. |
 | `alu` | Ejecutar operaciones ALU y comparaciones requeridas. | Seleccionar por sí sola el flujo completo del programa. |
-| `hazard_unit` | Detectar dependencias/conflictos y solicitar forwarding, stall o flush. | Alterar los resultados arquitectónicos para "arreglar" una prueba. |
+| `hazard_unit` | Detectar dependencias que el forwarding no resuelve (load-use) y solicitar stall o flush. | Alterar los resultados arquitectónicos para "arreglar" una prueba. |
 | `forwarding_unit` | Seleccionar operandos recientes disponibles desde etapas posteriores cuando sea posible. | Enmascarar una dependencia cuyo dato aún no existe; load-use puede requerir stall. |
 | `pipeline_registers` | Conservar datos, controles y validez entre etapas. | Tener decisiones de protocolo UART o interfaz de PC. |
 | `halt_controller` | Reconocer la instrucción custom HALT, controlar el fin de la búsqueda, impedir efectos de instrucciones posteriores y esperar a que el pipeline se vacíe antes de activar done. | Debe operar mediante señales síncronas de control y nunca detener ni modificar el clock físico. |

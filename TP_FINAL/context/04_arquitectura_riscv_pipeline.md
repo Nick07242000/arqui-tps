@@ -212,7 +212,11 @@ Todo avanza en el **flanco de subida de `clk`** condicionado por `cpu_en`. Entre
 
 ## 3. Latches de pipeline y validez
 
-Cada latch tiene `valid`. Una **burbuja** es un latch con `valid=0`; **ninguna** burbuja produce efectos (escritura de registro, store, redirect, `halting`, flags sticky, contador `retired`). Tras reset todos los `valid` son 0 («etapa vacía»). La distinción «burbuja» vs «vacía» no se almacena: ambas son `valid=0` (suficiente para el requisito de que el pipeline esté vacío al terminar).
+Cada latch tiene `valid`. Una **burbuja** es un latch con `valid=0`; **ninguna** burbuja produce efectos (escritura de registro, store, redirect, `halting`, flags sticky, contador `retired`). 
+
+Tras reset todos los `valid` son 0 («etapa vacía»). La distinción «burbuja» vs «vacía» no se almacena: ambas son `valid=0` (suficiente para el requisito de que el pipeline esté vacío al terminar).
+
+Al insertar una burbuja el latch se limpia por completo, por lo que `GET_PIPELINE` la muestra con `pc` e `instr` en cero. El cliente debe decidir por `valid`, no por esos valores.
 
 ### 3.1 Word de control (`ctrl`, 16 bits): formato de `GET_PIPELINE`
 
@@ -414,7 +418,7 @@ Efecto del stall (todo lo demás sigue avanzando):
 | --- | --- |
 | `PC` | congelado |
 | `IF/ID` (y `imem_ce`) | congelado (`valid`, `pc`, `instr` se conservan) |
-| `ID/EX` | recibe burbuja (`valid=0`, controles de efecto en 0) |
+| `ID/EX` | recibe burbuja: el latch se limpia por completo (todos los campos en 0, igual que con reset) |
 | `EX/MEM`, `MEM/WB` | siguen avanzando normalmente |
 
 > Un `store` cuyo dato (`rs2`) viene de un `lw` inmediatamente anterior también produce stall (`uses_rs2=1`). Es una simplificación deliberada (existiría un forward MEM→MEM, pero no justifica la complejidad).
@@ -888,6 +892,8 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-19 | Un módulo de latch por frontera (`if_id_register`, `id_ex_register`, `ex_mem_register`, `mem_wb_register`) | Un único `pipeline_registers`; el `register` genérico por campo o con todo empaquetado | Interfaz corta y propia por latch, campos con nombre, ampliable en US-3.2/3.3 | Un `always` similar repetido en cuatro módulos |
 | ADR-20 | Controles como señales con nombre en el RTL; `ctrl`/`ctrl8` solo son el formato de `GET_PIPELINE` | Palabra `ctrl` empaquetada en los latches | Legibilidad: se evita decodificar posiciones de bits en cada etapa | El empaquetado se hace en E5 al armar `dbg_pipe` |
 | ADR-21 | Bit `access_out_of_range` en `MEM/WB` | Recalcular el rango en WB; no zerar el load fuera de rango | El rango se verifica en MEM pero el load se resuelve en WB | Usa el bit 6 reservado de `ctrl8` de `MEM/WB` |
+| ADR-22 | Burbuja en `ID/EX` con `i_insert_bubble`, que limpia el latch completo | Solo `enable`; limpiar solo `valid` y controles | Un `enable` no alcanza: el load debe avanzar a `EX/MEM` mientras `ID/EX` recibe un vacío | `register_id_ex` tiene una entrada más, reutilizable para el flush de la US-3.3 |
+| ADR-23 | Forwarding por coincidencia de número de registro, sin `uses_rs` | Hacer viajar `uses_rs1/2` por los latches | Si el campo no es una fuente el valor adelantado se ignora; solo el stall necesita `uses_rs` | Cero FF extra |
 
 ---
 
@@ -929,10 +935,9 @@ Las pruebas y evidencias de cada fila se asignarán en E1–E8 (regla de trazabi
 
 ## 14. Inconsistencias detectadas y puntos a confirmar
 
-1. **Forwarding vs. solo stalls.** T0.1.6 del roadmap dice «stalls sin forwarding», pero la teoría, los lineamientos y US-3.2 indican forwarding con stalls como plan B. *Este documento sigue la segunda lectura.* Conviene corregir T0.1.6.
-2. **Vivado vs. Gowin EDA.** La consigna exige reportes de Vivado; la placa es una Tang Nano 20K. Confirmar con el profesor que se aceptan los reportes de Gowin.
-3. **«Frecuencia óptima» vs. «sin PLL».** La consigna pide encontrar y *aplicar* una frecuencia óptima. Si esta difiere de 27 MHz hará falta un `rPLL` (no es intervención manual del clock, pero conviene confirmarlo).
-4. **`ld` en la tabla de la consigna.** Aparece `ld` (funct3 `011`), que es RV64. La lista obligatoria es RV32 (`lb/lh/lw/lbu/lhu`). No se implementa `ld`; se decodifica como ilegal.
-5. **HALT agregado automáticamente (T6.1.2) vs. «el programa debe incluir HALT».** Se adopta que el programador escribe `halt` y la herramienta solo avisa si falta.
-6. **US-4.2: «las palabras cargadas se leen idénticas a las enviadas».** Con los comandos mínimos no hay lectura de vuelta de `imem` por UART. Se verifica en simulación; si se desea verificación en hardware, agregar un `GET_PROGRAM` (P2, requiere segundo puerto de lectura de `imem`).
-7. **Tamaños de memoria y datos de placa** (cantidad de BSRAM, pines UART/botón/LED): verificar en el datasheet/esquemático antes de E7.
+1. **Vivado vs. Gowin EDA.** La consigna exige reportes de Vivado; la placa es una Tang Nano 20K. Confirmar con el profesor que se aceptan los reportes de Gowin.
+2. **«Frecuencia óptima» vs. «sin PLL».** La consigna pide encontrar y *aplicar* una frecuencia óptima. Si esta difiere de 27 MHz hará falta un `rPLL` (no es intervención manual del clock, pero conviene confirmarlo).
+3. **`ld` en la tabla de la consigna.** Aparece `ld` (funct3 `011`), que es RV64. La lista obligatoria es RV32 (`lb/lh/lw/lbu/lhu`). No se implementa `ld`; se decodifica como ilegal.
+4. **HALT agregado automáticamente (T6.1.2) vs. «el programa debe incluir HALT».** Se adopta que el programador escribe `halt` y la herramienta solo avisa si falta.
+5. **US-4.2: «las palabras cargadas se leen idénticas a las enviadas».** Con los comandos mínimos no hay lectura de vuelta de `imem` por UART. Se verifica en simulación; si se desea verificación en hardware, agregar un `GET_PROGRAM` (P2, requiere segundo puerto de lectura de `imem`).
+6. **Tamaños de memoria y datos de placa** (cantidad de BSRAM, pines UART/botón/LED): verificar en el datasheet/esquemático antes de E7.

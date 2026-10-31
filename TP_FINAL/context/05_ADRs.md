@@ -310,3 +310,57 @@ Durante ciclos irregulares (como el arranque) o frente a combinaciones particula
 ### Consecuencias
 
 * Prevención de interbloqueos (deadlocks) en el arranque o comportamientos indefinidos transitorios.
+
+## ADR - Inserción de burbujas en ID/EX
+
+### Contexto
+
+En un stall load-use, el `load` debe avanzar de EX a MEM mientras la instrucción dependiente espera en ID. `ID/EX` no puede retener su contenido (el load se capturaría dos veces en `EX/MEM`) ni capturar de ID (ejecutaría la dependiente con un dato viejo).
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Controlar la burbuja solo con `i_enable`. |
+| A | Entrada `i_insert_bubble` que limpia solo `valid` y los controles de efecto. |
+| **B** | **Entrada `i_insert_bubble` que limpia el latch completo, como el reset.** |
+
+### Decisión
+
+**Opción B.**
+
+### Motivos
+
+- `i_enable` solo puede retener o capturar; una burbuja requiere capturar "nada".
+- Es consistente con el ADR del alcance del reset: una burbuja se ve en debug como una etapa vacía.
+
+### Consecuencias
+
+- La burbuja solo se inserta si el CPU avanza (`i_enable && i_insert_bubble`).
+- La US-3.3 reutiliza la misma entrada para el flush.
+
+## ADR - Forwarding sin `uses_rs`
+
+### Contexto
+
+El forwarding compara `rs1`/`rs2` de la instrucción en EX contra el destino de `EX/MEM` y `MEM/WB`, pero algunos formatos usan esos bits como inmediato.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Hacer viajar `uses_rs1/2` por `ID/EX` y condicionar el forwarding. |
+| **A** | **Comparar solo números de registro; `uses_rs` se usa únicamente para el stall.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Si el campo no es una fuente, el valor adelantado nunca se consume (la ALU usa el inmediato).
+- Un stall falso sí cuesta un ciclo, por eso ahí sí se usa `uses_rs`.
+
+### Consecuencias
+
+- `store_data` de instrucciones que no son stores puede mostrar un valor adelantado sin significado, sin efectos.
