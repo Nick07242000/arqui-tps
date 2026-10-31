@@ -893,3 +893,208 @@ El modelo está pensado para que gran parte se traslade al pipeline sin cambios:
 
 - Las decisiones de control (`next_pc_select`, `writeback_select`) y el comparador de branches pasan casi iguales a la etapa EX.
 - Lo que cambia es el control de avance: el `load_wait_register` y el congelamiento por `HALT` se reemplazan por la unidad de riesgos (stall y flush) y por el controlador de HALT.
+
+## Datapath Segmentado
+
+Esta etapa del proyecto convierte los bloques construidos en E1 (ALU, banco de registros, decodificador, generador de inmediatos y memorias) en un **procesador de cinco etapas**: IF, ID, EX, MEM y WB. Entre cada par de etapas hay un **latch de pipeline** que guarda todo lo que la instrucción necesita para seguir su camino.
+
+La idea es la de una línea de montaje: mientras una instrucción se ejecuta en EX, la siguiente se decodifica en ID y una tercera se busca en IF. En régimen, una instrucción termina por ciclo.
+
+### Qué se logró
+
+- Un CPU de cinco etapas (`cpu_core`) con cuatro latches: IF/ID, ID/EX, EX/MEM y MEM/WB.
+- Un bit `valid` en cada latch, para distinguir una instrucción real de una burbuja o de una etapa vacía.
+- Todo el avance del pipeline controlado por una señal de habilitación (`i_cpu_en`), sin tocar el reloj.
+- Un testbench que registra, ciclo a ciclo, qué instrucción ocupa cada etapa y comprueba que cada escritura ocurre una sola vez.
+
+Esta versión **no resuelve riesgos** de datos ni de control: eso llega en US-3.2 y US-3.3 (ver [Alcance](#alcance-de-esta-versión)).
+
+### Vista general
+
+```mermaid
+flowchart LR
+  IF["IF<br/>PC + program_memory"] --> L1[["IF/ID"]]
+  L1 --> ID["ID<br/>decodificador, inmediatos,<br/>banco de registros"]
+  ID --> L2[["ID/EX"]]
+  L2 --> EX["EX<br/>ALU"]
+  EX --> L3[["EX/MEM"]]
+  L3 --> MEM["MEM<br/>data_memory"]
+  MEM --> L4[["MEM/WB"]]
+  L4 --> WB["WB<br/>extensión de loads"]
+  WB -.->|"escribe rd"| ID
+```
+
+### Las cinco etapas
+
+| Etapa | Qué hace | Módulos que usa |
+| --- | --- | --- |
+| **IF** | Presenta el PC a la memoria de programa y calcula `PC + 4`. | `register` (PC), `program_memory` |
+| **ID** | Corta los campos `rs1`, `rs2`, `rd` y `funct3`, decodifica los controles, genera el inmediato y lee los dos registros fuente. | `control_unit`, `immediate_generator`, `registers` |
+| **EX** | Elige el segundo operando (registro o inmediato), opera en la ALU y elige el resultado: el de la ALU, o `PC + 4` en `jal`/`jalr`. | `mux`, `alu` |
+| **MEM** | Verifica rango y alineación del acceso, arma los *byte enables* y el dato del store, y accede a la memoria de datos. | `data_access_checker`, `store_data_formatter`, `data_memory` |
+| **WB** | Selecciona byte, media palabra o palabra del dato leído, extiende signo o ceros, elige entre ese dato y el resultado de EX, y escribe `rd`. | `load_data_extender`, `mux`, `registers` |
+
+### Latches de pipeline
+
+Cada latch captura sus entradas en el flanco de reloj en que el CPU avanza (`i_cpu_en = 1`). Los campos `pc` e `instruction` viajan en todos los latches **solo para depuración** (alimentarán `GET_PIPELINE`); las etapas no los usan para calcular.
+
+#### IF/ID
+
+| Campo | Ancho | Descripción |
+| --- | --- | --- |
+| `valid` | 1 | La etapa contiene una instrucción real. |
+| `pc` | 32 | PC con el que se buscó la instrucción. |
+| `instruction` | 32 | Palabra de instrucción. No está en el módulo del latch: es la salida registrada de `program_memory` (ver [Las memorias como parte de los latches](#las-memorias-como-parte-de-los-latches)). |
+
+#### ID/EX
+
+| Campo | Ancho | Descripción | Se usa en |
+| --- | --- | --- | --- |
+| `valid`, `pc`, `instruction` | 1 / 32 / 32 | Identifican la instrucción. | validez en todo el pipeline; el resto es depuración |
+| `rs1_value`, `rs2_value` | 32 | Valores leídos del banco de registros. | EX (`rs2_value` también viaja como dato de store) |
+| `immediate` | 32 | Inmediato ya extendido. | EX |
+| `rs1_addr`, `rs2_addr`, `rd_addr` | 5 | Índices de registros. | `rd_addr` en WB; `rs1_addr`/`rs2_addr` en US-3.2 (forwarding) |
+| `alu_op` | 4 | Operación de la ALU. | EX |
+| `alu_src_b_is_imm` | 1 | Segundo operando: 0 = `rs2`, 1 = inmediato. | EX |
+| `reg_write`, `mem_read`, `mem_write` | 1 | Qué efecto tiene la instrucción. | MEM y WB |
+| `funct3` | 3 | Tamaño y signo de loads/stores. | MEM y WB |
+| `is_jal`, `is_jalr` | 1 | Saltos con dirección de retorno. | EX (resultado = `PC + 4`) |
+| `is_branch` | 1 | `beq` / `bne`. | US-3.3 |
+| `is_halt`, `is_illegal` | 1 | Parada e instrucción no soportada. | E4 |
+
+#### EX/MEM
+
+| Campo | Ancho | Descripción |
+| --- | --- | --- |
+| `valid`, `pc`, `instruction` | 1 / 32 / 32 | Identifican la instrucción. |
+| `result` | 32 | Resultado de la ALU, o `PC + 4` en `jal`/`jalr`. En loads y stores es la **dirección efectiva**. |
+| `store_data` | 32 | Valor de `rs2`, que escribirá un store. |
+| `rd_addr` | 5 | Registro destino. |
+| `reg_write`, `mem_read`, `mem_write`, `funct3` | 1 / 1 / 1 / 3 | Controles que siguen vigentes en MEM y WB. |
+
+#### MEM/WB
+
+| Campo | Ancho | Descripción |
+| --- | --- | --- |
+| `valid`, `pc`, `instruction` | 1 / 32 / 32 | Identifican la instrucción. |
+| `result` | 32 | Resultado de EX; en loads, la dirección efectiva (sus 2 bits bajos eligen el byte o media palabra). |
+| `raw_data` | 32 | Palabra leída de memoria. No está en el módulo del latch: es la salida registrada de `data_memory`. |
+| `rd_addr` | 5 | Registro destino. |
+| `reg_write`, `mem_read`, `mem_write`, `funct3` | 1 / 1 / 1 / 3 | Controles para WB. |
+| `access_out_of_range` | 1 | El acceso a datos cayó fuera de la memoria; un load así devuelve 0. |
+
+### Validez: instrucciones, burbujas y etapas vacías
+
+Cada latch tiene un bit `valid`. Si vale 0, el contenido del latch **no produce ningún efecto**: no escribe registros, no escribe memoria y no dispara chequeos. Los efectos se bloquean en dos puntos:
+
+| Efecto | Condición para que ocurra |
+| --- | --- |
+| Escritura de registro (WB) | `valid` y `reg_write`, destino distinto de `x0` y `i_cpu_en = 1` |
+| Escritura de memoria (MEM) | `valid` y `mem_write`, acceso en rango, `i_cpu_en = 1` y sin reset |
+
+Tras un reset todos los `valid` valen 0 (pipeline vacío). Con los primeros flancos habilitados se van llenando de a una etapa por ciclo.
+
+Una palabra que no es una instrucción soportada (por ejemplo `0x00000000`, lo que hay en la memoria de programa después del último programa cargado) se decodifica como **ilegal** y se neutraliza: viaja por el pipeline como una instrucción válida pero con todos sus controles de efecto en cero.
+
+### Las memorias como parte de los latches
+
+Las dos memorias leen de forma síncrona: el dato pedido en un ciclo aparece en su salida en el ciclo siguiente. Eso coincide exactamente con lo que haría un latch, así que **la salida de la memoria cumple ese rol** y no se guarda una segunda copia:
+
+- **IF/ID:** el PC del ciclo *t* direcciona `program_memory`; en el ciclo *t + 1* su salida entrega la instrucción y `IF/ID.pc` contiene el PC de esa misma instrucción.
+- **MEM/WB:** la dirección calculada en EX direcciona `data_memory`; en el ciclo de WB su salida entrega la palabra leída.
+
+Guardar la instrucción o el dato en un registro adicional los retrasaría un ciclo. Para que estas salidas se congelen cuando el CPU está pausado, la lectura de ambas memorias se habilita con `i_cpu_en`.
+
+### Control de avance: `i_cpu_en` y `i_cpu_reset`
+
+| Señal | Efecto |
+| --- | --- |
+| `i_cpu_en = 1` | El pipeline avanza un ciclo: PC, latches, banco de registros y lecturas de memoria. |
+| `i_cpu_en = 0` | No cambia nada, incluidas las escrituras. Una instrucción que estaba por escribir un registro o la memoria espera y lo hace **una sola vez** al reanudar. |
+| `i_cpu_reset = 1` | Tiene prioridad sobre `i_cpu_en`. PC en 0, `x1`–`x31` en 0 y todos los latches vacíos. La memoria de datos conserva su contenido. |
+
+El reloj físico nunca se detiene ni se deriva; solo se habilita o no el avance. Así quedará implementado el modo paso a paso (`STEP`).
+
+### Interfaz de `cpu_core`
+
+Las memorias quedan fuera del módulo, para que la Debug Unit pueda acceder a ellas.
+
+| Señal | Dir | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Reloj único del sistema. |
+| `i_cpu_reset` | in | 1 | Reset síncrono del CPU. |
+| `i_cpu_en` | in | 1 | Habilita el avance de un ciclo. |
+| `o_imem_read_enable` | out | 1 | Habilita la lectura de la memoria de programa. |
+| `o_imem_word_addr` | out | 10 | Índice de palabra a leer (`PC[11:2]`). |
+| `i_imem_read_data` | in | 32 | Instrucción leída (1 ciclo de latencia). |
+| `o_dmem_read_enable` | out | 1 | Habilita la lectura de la memoria de datos. |
+| `o_dmem_word_addr` | out | 10 | Índice de palabra accedido. |
+| `o_dmem_write_byte_enable` | out | 4 | Bytes a escribir; `0000` si no hay store efectivo. |
+| `o_dmem_write_data` | out | 32 | Dato del store, replicado por *lanes*. |
+| `i_dmem_read_data` | in | 32 | Palabra leída (1 ciclo de latencia). |
+| `i_debug_reg_addr` | in | 5 | Registro a consultar (solo lectura). |
+| `o_debug_reg_data` | out | 32 | Valor almacenado en ese registro. |
+
+El parámetro `MEM_ADDR_WIDTH` (por defecto 10) fija la profundidad de ambas memorias.
+
+### Alcance de esta versión
+
+| Situación | Qué ocurre hoy | Se resuelve en |
+| --- | --- | --- |
+| Una instrucción usa un resultado producido menos de 3 instrucciones antes | Lee el valor viejo del registro | US-3.2 (forwarding y stall) |
+| `beq`, `bne`, `jal`, `jalr` | No modifican el PC; `jal`/`jalr` sí escriben `PC + 4` en `rd` | US-3.3 |
+| `HALT` y fin de la imagen | Se decodifica, pero el PC sigue avanzando | US-4.3 |
+| Debug Unit | `i_cpu_en` e `i_cpu_reset` los maneja el testbench | E5 |
+
+**Regla para los programas de prueba hasta US-3.2:** productor y consumidor deben estar separados por al menos 3 instrucciones (o por `nop`). A distancia 3, el banco de registros ya entrega el dato de WB a la lectura de ID del mismo ciclo (*bypass*), por lo que ese caso funciona sin lógica extra.
+
+### Verificación
+
+El testbench `cpu_core_tb` hace de Debug Unit: carga el programa por el puerto de escritura de `program_memory`, aplica reset y maneja `i_cpu_en`.
+
+**Escenario A** ejecuta 39 instrucciones que cubren todas las operaciones R e I-ALU, `lui`, los tres tamaños de store y los cinco loads, incluido un consumidor a distancia 3 de un `lw` y una escritura a `x0`. A mitad de la ejecución (paso 27) se pausa `i_cpu_en` durante tres ciclos, justo cuando un `sw` está en MEM y una escritura de registro está en WB.
+
+**Escenario B** corre tras un reset y comprueba que un store fuera de rango no se escribe y que un load fuera de rango devuelve 0.
+
+| Criterio | Cómo se comprueba |
+| --- | --- |
+| Cinco etapas distintas avanzando con el reloj | En cada ciclo, la instrucción de cada latch debe ser la esperada según su posición en el programa. |
+| Varias instrucciones en etapas distintas a la vez | Misma comprobación; desde el paso 4 las cuatro etapas están ocupadas. |
+| Datos y controles pertenecen a la misma instrucción | Cada latch válido se re-decodifica con un `control_unit` de referencia y se compara contra sus controles; `rd`, `rs1`, `rs2` y `funct3` deben coincidir con la palabra de instrucción. |
+| Escrituras una sola vez | Se cuentan las escrituras de registro y de memoria por instrucción: ninguna supera 1 y el total coincide con el esperado (32 y 6 en el escenario A). |
+| Sin riesgos, resultados correctos | Los 32 registros y 4 palabras de memoria se comparan con un modelo de referencia en Python, con el programa ensamblado con binutils RISC-V. |
+
+Resultado: **PASS (0 errores)**. Para comprobar que el testbench detecta fallos se inyectaron 7 errores en el RTL (store sin habilitación, load fuera de rango sin poner 0, store fuera de rango sin suprimir, `rd` mal conectado, control desalineado, `valid` forzado, latch sin reset); los 7 fueron detectados. El RTL además sintetiza sin errores con `synth_gowin` de Yosys.
+
+Fragmento de la traza (cada columna indica el índice de la instrucción que ocupa la etapa; `--` es una etapa vacía):
+
+| Paso | IF | ID | EX | MEM | WB |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 0 | -- | -- | -- | -- |
+| 1 | 1 | 0 | -- | -- | -- |
+| 2 | 2 | 1 | 0 | -- | -- |
+| 3 | 3 | 2 | 1 | 0 | -- |
+| 4 | 4 | 3 | 2 | 1 | 0 |
+| 5 | 5 | 4 | 3 | 2 | 1 |
+
+Para ejecutarlo con Icarus Verilog, desde la carpeta con los fuentes:
+
+```bash
+iverilog -g2012 -I . -o cpu_core_tb \
+    cpu_core_tb.v cpu_core.v if_id_register.v id_ex_register.v ex_mem_register.v mem_wb_register.v \
+    program_memory.v data_memory.v control_unit.v immediate_generator.v registers.v register.v \
+    mux.v alu.v data_access_checker.v store_data_formatter.v load_data_extender.v
+vvp cpu_core_tb
+```
+
+### Decisiones de diseño
+
+| Decisión | Motivo | Consecuencia |
+| --- | --- | --- |
+| Cuatro módulos de latch (uno por frontera) en lugar de un único `pipeline_registers` | Cada latch tiene una interfaz corta y propia, fácil de leer y de ampliar | La arquitectura (`04`) los lista como un solo módulo; se materializa en cuatro |
+| Señales de control con nombre en los latches, no la palabra `ctrl` de 16 bits | Se entiende qué hace cada cable sin decodificar posiciones de bits | El empaquetado del formato de `GET_PIPELINE` se hace en E5, al armar `dbg_pipe` |
+| Bit `access_out_of_range` en MEM/WB | El rango se verifica en MEM, pero el load devuelve 0 recién en WB | Usa el bit 6, hoy reservado, de `ctrl8` en `04` §3.1: actualizar ese documento |
+| Reset de todos los campos de los latches, no solo de `valid` | Las consultas de depuración tras un reset muestran ceros, no restos de la ejecución anterior | Costo despreciable: el reset síncrono es propio de los flip-flops de la FPGA |
+| `cpu_core` ya expone `i_debug_reg_addr` / `o_debug_reg_data` | Reutiliza el puerto de debug del banco de registros y deja lista la consulta de `GET_REGS` | Ninguna |
+
+Algunas salidas quedan sin conectar a propósito hasta que exista su consumidor: `o_uses_rs1`/`o_uses_rs2` del decodificador (US-3.2) y `o_is_misaligned` del chequeo de accesos (E5). La síntesis elimina los campos `pc` e `instruction` de los latches mientras nadie los lea; reaparecerán al conectar el snapshot de depuración, y conviene medir recursos y timing recién después.

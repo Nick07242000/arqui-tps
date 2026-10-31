@@ -70,11 +70,14 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
     ├── hazard_unit          # stall load-use y flush
     ├── alu
     ├── halt_controller      # halting, done, done_reason
-    ├── pipeline_registers   # IF/ID, ID/EX, EX/MEM, MEM/WB (con valid)
+    ├── if_id_register       # latch IF/ID (valid, pc)
+    ├── id_ex_register       # latch ID/EX
+    ├── ex_mem_register      # latch EX/MEM
+    ├── mem_wb_register      # latch MEM/WB
     └── perf_counters        # cycles, retired
 ```
 
-Los nombres siguen la tabla del roadmap (§2); `halt_controller`, `hazard_unit` y `pc_control` pueden fusionarse en un solo módulo si las interfaces siguen siendo explícitas.
+Los nombres siguen la tabla del roadmap (§2); `halt_controller`, `hazard_unit` y `pc_control` pueden fusionarse en un solo módulo si las interfaces siguen siendo explícitas. `pipeline_registers` se materializa en cuatro módulos, uno por latch. Hasta US-3.3 el PC es una instancia de `register` dentro de `cpu_core`.
 
 ### 1.2 Parámetros globales
 
@@ -211,7 +214,9 @@ Todo avanza en el **flanco de subida de `clk`** condicionado por `cpu_en`. Entre
 
 Cada latch tiene `valid`. Una **burbuja** es un latch con `valid=0`; **ninguna** burbuja produce efectos (escritura de registro, store, redirect, `halting`, flags sticky, contador `retired`). Tras reset todos los `valid` son 0 («etapa vacía»). La distinción «burbuja» vs «vacía» no se almacena: ambas son `valid=0` (suficiente para el requisito de que el pipeline esté vacío al terminar).
 
-### 3.1 Word de control (`ctrl`, 16 bits, viaja en `ID/EX`)
+### 3.1 Word de control (`ctrl`, 16 bits): formato de `GET_PIPELINE`
+
+En el RTL los controles viajan como señales con nombre en cada latch (por ejemplo `id_ex_reg_write`). `ctrl` y `ctrl8` solo definen cómo se empaquetan en la respuesta de `GET_PIPELINE`; el empaquetado se arma en E5, al construir `dbg_pipe`.
 
 | Bits | Campo | Significado |
 | --- | --- | --- |
@@ -229,7 +234,9 @@ Cada latch tiene `valid`. Una **burbuja** es un latch con `valid=0`; **ninguna**
 
 `uses_rs1` / `uses_rs2` **no viajan**: se calculan en ID solo para detectar *load-use* (evita stalls espurios cuando un campo no es fuente).
 
-`EX/MEM.ctrl` y `MEM/WB.ctrl` (8 bits): `[0]` reg_write, `[1]` mem_read, `[2]` mem_write, `[5:3]` funct3, `[7:6]` = 0.
+`EX/MEM.ctrl` y `MEM/WB.ctrl` (8 bits): `[0]` reg_write, `[1]` mem_read, `[2]` mem_write, `[5:3]` funct3.
+
+En `EX/MEM`, `[7:6]` = 0. En `MEM/WB`, `[6]` = `access_out_of_range` (el acceso a datos cayó fuera de la memoria; un load así devuelve 0) y `[7]` = 0.
 
 ### 3.2 Contenido de cada latch (también es el formato de `GET_PIPELINE`)
 
@@ -263,7 +270,7 @@ Todos los campos de 32 bits en little-endian. Cada latch también transporta `pc
 | | +9 | 4 | `result` (ALU/link; en loads = dirección efectiva) |
 | | +13 | 4 | `mem_raw` (palabra leída; solo significativa si `mem_read`) |
 | | +17 | 1 | `rd` |
-| | +18 | 1 | `ctrl8` |
+| | +18 | 1 | `ctrl8` (bit 6 = `access_out_of_range`) |
 
 Offsets absolutos en la respuesta (73 B): IF/ID `0`, ID/EX `9`, EX/MEM `35`, MEM/WB `54`. El CPU expone un vector plano `dbg_pipe[583:0]` y la Debug Unit lo serializa byte a byte (la CPU está pausada, no hay riesgo de inconsistencia).
 
@@ -359,7 +366,7 @@ Sin sumadores extra ni *shifters* en MEM:
 | Caso | Comportamiento |
 | --- | --- |
 | Acceso desalineado (`lh/sh` con `addr[0]=1`, `lw/sw` con `addr[1:0]≠0`) | **Fuera de contrato**: se alinea hacia abajo (ignora los bits bajos). Sin excepción, pero se levanta el flag sticky `misaligned_seen`. |
-| Dirección de datos `addr[31:12] ≠ 0` | Store **suprimido**, load devuelve 0, flag sticky `dmem_oob_seen` |
+| Dirección de datos `addr[31:12] ≠ 0` | Store **suprimido**, load devuelve 0, flag sticky `dmem_oob_seen`. El rango se verifica en MEM; el bit `access_out_of_range` viaja en `MEM/WB` para poner el load en 0 en WB |
 | PC con `pc[1:0] ≠ 0` (p. ej. por `jalr`) | Ignora los 2 bits bajos para indexar `imem` |
 | Dirección de fetch ≥ `N_WORDS·4` | No se busca (ver §6.3) |
 
@@ -878,6 +885,9 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-16 | `dmem` como 4 bancos de byte con puerto B de debug | Una memoria 32 bits con byte-enable | Inferencia portable, consultas sin alterar el CPU | Posible duplicación de BRAM |
 | ADR-17 | Contadores `cycles`/`retired` | Omitirlos | Muy baratos y útiles para analizar CPI y penalizaciones | +64 FF |
 | ADR-18 | GNU `as` + macro `halt`; script no agrega HALT solo | Ensamblador propio; HALT automático | Reutilizar herramientas; poder probar `END_OF_IMAGE` | Aviso si falta HALT |
+| ADR-19 | Un módulo de latch por frontera (`if_id_register`, `id_ex_register`, `ex_mem_register`, `mem_wb_register`) | Un único `pipeline_registers`; el `register` genérico por campo o con todo empaquetado | Interfaz corta y propia por latch, campos con nombre, ampliable en US-3.2/3.3 | Un `always` similar repetido en cuatro módulos |
+| ADR-20 | Controles como señales con nombre en el RTL; `ctrl`/`ctrl8` solo son el formato de `GET_PIPELINE` | Palabra `ctrl` empaquetada en los latches | Legibilidad: se evita decodificar posiciones de bits en cada etapa | El empaquetado se hace en E5 al armar `dbg_pipe` |
+| ADR-21 | Bit `access_out_of_range` en `MEM/WB` | Recalcular el rango en WB; no zerar el load fuera de rango | El rango se verifica en MEM pero el load se resuelve en WB | Usa el bit 6 reservado de `ctrl8` de `MEM/WB` |
 
 ---
 
@@ -903,7 +913,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 
 | Requisito | Módulos responsables |
 | --- | --- |
-| Pipeline de 5 etapas con latches | `pipeline_registers`, `cpu_core` |
+| Pipeline de 5 etapas con latches | `if_id_register`, `id_ex_register`, `ex_mem_register`, `mem_wb_register`, `cpu_core` |
 | ISA enumerada | `control_unit`, `immediate_generator`, `alu`, `register_file`, `data_memory` |
 | Riesgos de datos/control/estructurales | `hazard_unit`, `forwarding_unit`, `pc_control`, memorias separadas |
 | 32 registros, latches y memoria de datos por UART | `debug_unit`, `register_file` (puerto debug), `dbg_pipe`, `data_memory` (puerto B) |
