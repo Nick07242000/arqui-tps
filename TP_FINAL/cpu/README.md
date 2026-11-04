@@ -1268,3 +1268,277 @@ Cada test de integración compara registros, memoria y tres contadores: **stalls
 | `lb` y `lbu` con consumidor inmediato | 2 stalls, extensión de signo y de ceros correctas |
 
 **Validación de los tests.** Para comprobar que los tests detectan errores y no solo "pasan", se probaron 12 versiones del diseño con una falla introducida a propósito: sin forwarding desde `EX/MEM`, sin forwarding desde `MEM/WB`, prioridad invertida, forwarding de `x0`, sin stall, stall que ignora `uses_rs`, store sin forwarding, stall que no congela el PC, stall que no congela la memoria de programa, stall sin burbuja, sin la guarda de load y sin la guarda de `IF/ID` válido. **Los 12 fueron detectados** por al menos un test.
+
+## Riesgos de control
+
+> **En una frase:** el procesador resuelve `beq`, `bne`, `jal` y `jalr` en la etapa EX. 
+> Si el salto se toma, descarta las dos instrucciones que había buscado de más y sigue desde el destino. 
+> Cada salto tomado cuesta **2 ciclos**; un `branch` no tomado no cuesta ninguno.
+
+### El problema
+
+Un pipeline busca una instrucción nueva en cada ciclo. 
+Cuando aparece un salto, el procesador todavía no sabe si va a saltar: eso se decide recién cuando el salto llega a la etapa EX.
+Mientras tanto, siguió buscando las instrucciones que están a continuación en memoria.
+
+Si el salto se toma, esas instrucciones **no pertenecen al camino real del programa**. 
+No pueden escribir un registro, ni guardar en memoria, ni cambiar el PC. 
+Eso es un *riesgo de control*, y hay que responder tres preguntas:
+
+| Pregunta | Respuesta en este diseño |
+| --- | --- |
+| ¿Dónde se decide el salto? | En **EX**, con los operandos ya adelantados por el forwarding. |
+| ¿Cómo se elige el próximo PC? | Un multiplexor: `PC + 4` (secuencial) o el destino calculado en EX. |
+| ¿Qué pasa con lo que se buscó de más? | Se convierte en **burbuja** (flush de `IF/ID` e `ID/EX`). |
+
+### Decisiones de diseño
+
+| Tema | Decisión |
+| --- | --- |
+| Etapa de resolución | EX. Es la única etapa que redirige el PC. |
+| Predicción | Ninguna. Se asume "no tomado" y se corrige si el salto se toma. |
+| Penalización | **2 ciclos** por salto tomado (`beq`/`bne` tomado, `jal`, `jalr`). 0 ciclos si el `branch` no se toma. |
+| Instrucciones anuladas | Las dos más jóvenes: la que está en ID y la que se está buscando en IF. |
+| Cómo se anulan | `IF/ID` e `ID/EX` reciben una burbuja (`valid = 0`, campos en cero). |
+| Destino de `jalr` | `(rs1 + imm)` calculado por la ALU, con el bit 0 forzado a cero (regla de la ISA). |
+| Reloj | Sin cambios. Todo se habilita con `cpu_en`; el flush solo actúa en ciclos habilitados. |
+
+El detalle y las alternativas descartadas están en `05_ADRs_US-3.3.md`.
+
+### Cómo funciona
+
+#### Un salto tomado, ciclo por ciclo
+
+Programa de ejemplo:
+
+```asm
+0x00  addi x1, x0, 5
+0x04  beq  x1, x1, 0x10     # siempre se toma, salta a 0x10
+0x08  addi x3, x0, 111      # camino erróneo (nunca debe ejecutarse)
+0x0C  addi x4, x0, 222      # camino erróneo (nunca debe ejecutarse)
+0x10  addi x5, x0, 7        # destino
+0x14  addi x6, x0, 8
+```
+
+Traza obtenida de la simulación del RTL (`--` indica una etapa sin instrucción válida):
+
+| Ciclo | IF (PC pedido) | ID | EX | MEM | WB | `redirect` |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0x00 | -- | -- | -- | -- | 0 |
+| 2 | 0x04 | 0x00 | -- | -- | -- | 0 |
+| 3 | 0x08 | 0x04 | 0x00 | -- | -- | 0 |
+| **4** | 0x0C | 0x08 | **0x04** | 0x00 | -- | **1** |
+| 5 | 0x10 | -- | -- | 0x04 | 0x00 | 0 |
+| 6 | 0x14 | 0x10 | -- | -- | 0x04 | 0 |
+| **7** | 0x18 | 0x14 | **0x10** | -- | -- | 0 |
+| 8 | 0x1C | 0x18 | 0x14 | 0x10 | -- | 0 |
+
+Qué ocurre en el ciclo 4, cuando el `beq` está en EX y `redirect = 1`. Al llegar el flanco de reloj:
+
+1. **El PC carga el destino** (`0x10`) en lugar de `PC + 4`.
+2. **`IF/ID` se limpia**: se descarta la instrucción `0x0C` que se estaba buscando.
+3. **`ID/EX` se limpia**: la instrucción `0x08`, que estaba en ID, no entra a EX.
+4. El `beq` sigue su camino a MEM y WB, y las instrucciones anteriores no se tocan.
+
+Resultado: las instrucciones `0x08` y `0x0C` **nunca llegan a EX**, así que no pueden escribir nada. Los ciclos 5 y 6 muestran las burbujas que dejó el flush.
+
+**Penalización.** Sin salto, la instrucción siguiente entraría a EX un ciclo después del `beq` (ciclo 5). Con salto tomado entra en el ciclo 7. Se pierden **2 ciclos**. El testbench mide esta distancia (3 ciclos de EX a EX con salto tomado, 1 sin salto).
+
+#### ¿Por qué son exactamente dos instrucciones?
+
+Cuando el salto está en EX, detrás de él hay dos instrucciones en vuelo: una en ID y otra en IF. Ninguna puede haber llegado más lejos, porque el salto es la única instrucción que cambia el flujo y se resuelve justo en EX. Por eso el flush tiene un alcance fijo y alcanza con dos latches (`IF/ID` e `ID/EX`).
+
+#### Qué decide cada instrucción
+
+| Instrucción | ¿Cambia el flujo? | Destino | Valor escrito en `rd` |
+| --- | --- | --- | --- |
+| `beq` | si `rs1 == rs2` | `PC + imm` | no escribe |
+| `bne` | si `rs1 != rs2` | `PC + imm` | no escribe |
+| `jal` | siempre | `PC + imm` | `PC + 4` |
+| `jalr` | siempre | `(rs1 + imm) & ~1` | `PC + 4` |
+
+El valor de retorno (`PC + 4`) ya lo producía la etapa EX antes de esta US; esta US solo agrega la decisión y el destino.
+
+#### La condición usa operandos adelantados
+
+El comparador del `branch` no lee los valores del latch `ID/EX`, sino la salida de los multiplexores de forwarding. Así, un `beq` puede depender de la instrucción inmediatamente anterior:
+
+```asm
+addi x1, x0, 5
+beq  x1, x2, destino      # x1 llega por forwarding EX/MEM
+```
+
+Si el comparador usara el valor viejo de `x1`, el salto se decidiría con datos incorrectos. El caso `jalr` funciona igual, porque la ALU ya recibe `rs1` adelantado.
+
+Si el `beq` depende de un `lw` inmediato, actúa primero el stall load-use (el `beq` espera un ciclo en ID) y recién después se resuelve el salto.
+
+#### Convivencia con el stall load-use
+
+Ambos mecanismos nunca ocurren en el mismo ciclo, porque dependen de qué instrucción está en EX:
+
+| Mecanismo | Se activa cuando en EX hay… |
+| --- | --- |
+| Stall load-use | un `load` |
+| Flush por salto | un `branch`, `jal` o `jalr` |
+
+Una instrucción no puede ser ambas cosas a la vez. Los testbenches vigilan esta propiedad durante toda la simulación.
+
+#### Convivencia con el paso a paso (`cpu_en`)
+
+El flush y la carga del PC solo tienen efecto en ciclos con `cpu_en = 1`. Si el CPU se pausa con un salto en EX, la señal `redirect` queda activa pero nada cambia; en el siguiente ciclo habilitado se aplica. Un testbench verifica que, con `cpu_en = 0`, el PC y los latches no cambian (compara el PC, `valid` y `pc` de los cuatro latches e `instr` de `ID/EX`).
+
+### Módulos
+
+#### Visión general
+
+```mermaid
+flowchart LR
+  subgraph EX["Etapa EX"]
+    FWD["Operandos rs1 y rs2<br/>con forwarding"] --> BU["branch_unit"]
+    ALU["alu<br/>rs1 + imm"] -->|"destino de jalr"| BU
+    IDEX["Latch ID/EX<br/>pc, imm, tipo de salto"] --> BU
+  end
+  BU -->|"o_redirect, o_redirect_pc"| PCMUX["next_pc_mux"]
+  PCMUX --> PC["PC"]
+  BU -->|"o_redirect"| HU["hazard_unit"]
+  HU -->|"o_flush_front"| IFID["IF/ID: burbuja"]
+  HU -->|"o_flush_front"| IDEXB["ID/EX: burbuja"]
+```
+
+| Archivo | Estado | Cambio |
+| --- | --- | --- |
+| `branch_unit.v` | **nuevo** | Decide si el flujo cambia y calcula el destino. |
+| `register_if_id.v` | modificado | Nueva entrada `i_insert_bubble`. |
+| `hazard_unit.v` | modificado | Nueva entrada `i_ex_redirect` y salida `o_flush_front`. |
+| `cpu_core.v` | modificado | Mux del próximo PC, instancia de `branch_unit` y cableado del flush. |
+| `branch_unit_tb.v` | **nuevo** | Testbench unitario. |
+| `cpu_core_control_hazards_tb.v` | **nuevo** | Testbench de integración. |
+
+#### `branch_unit`
+
+Módulo combinacional. Recibe la instrucción que está en EX y entrega dos cosas: si hay que redirigir y hacia dónde.
+
+| Puerto | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_valid` | in | 1 | La instrucción en EX es válida (no es una burbuja). |
+| `i_is_branch` | in | 1 | Es `beq` o `bne`. |
+| `i_is_jal` | in | 1 | Es `jal`. |
+| `i_is_jalr` | in | 1 | Es `jalr`. |
+| `i_funct3` | in | 3 | Distingue `beq` de `bne`. |
+| `i_pc` | in | 32 | PC de la instrucción en EX. |
+| `i_immediate` | in | 32 | Desplazamiento del salto, ya extendido en signo. |
+| `i_rs1_value`, `i_rs2_value` | in | 32 | Operandos con forwarding. |
+| `i_alu_result` | in | 32 | `rs1 + imm`, usado solo por `jalr`. |
+| `o_redirect` | out | 1 | El próximo PC no es `PC + 4`. |
+| `o_redirect_pc` | out | 32 | Destino del salto. |
+
+La lógica completa cabe en pocas líneas:
+
+```verilog
+wire operands_are_equal = (i_rs1_value == i_rs2_value);
+
+wire branch_condition_is_met = (i_funct3 == `FUNCT3_BNE) ? !operands_are_equal
+                                                         :  operands_are_equal;
+
+wire [31:0] pc_relative_target = i_pc + i_immediate;           // branch y jal
+wire [31:0] jalr_target        = {i_alu_result[31:1], 1'b0};   // la ISA anula el bit 0
+
+assign o_redirect_pc = i_is_jalr ? jalr_target : pc_relative_target;
+assign o_redirect    = i_valid && ((i_is_branch && branch_condition_is_met)
+                                   || i_is_jal || i_is_jalr);
+```
+
+El término `i_valid` es clave: una burbuja en EX conserva a veces señales de control encendidas, y sin esta guarda podría redirigir el PC.
+
+#### `register_if_id`
+
+Se agrega `i_insert_bubble`, con la misma semántica que ya tenía `register_id_ex`: si el front-end avanza (`i_enable`) y se pide una burbuja, el latch se limpia por completo, igual que con reset. Sin `i_enable` no se limpia: así un CPU pausado no altera su estado.
+
+```verilog
+wire clear_latch = i_reset || (i_enable && i_insert_bubble);
+```
+
+#### `hazard_unit`
+
+Pasa a ser el único lugar donde se decide cómo se frena o se vacía el front-end. Se agregan:
+
+| Puerto | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_ex_redirect` | in | 1 | Hay un salto tomado en EX (viene de `branch_unit`). |
+| `o_flush_front` | out | 1 | Anular las instrucciones de IF e ID. |
+
+Hoy `o_flush_front` es `i_ex_redirect`. Está en este módulo para que la US-4.3 sume ahí la condición de `HALT` sin tocar el resto.
+
+#### `cpu_core`
+
+Los cambios son pequeños y están separados por etapa:
+
+| Etapa | Cambio |
+| --- | --- |
+| IF | `next_pc_mux` elige entre `PC + 4` y `ex_redirect_pc` según `ex_redirect`. El PC carga la salida del mux. |
+| IF/ID | `i_insert_bubble` conectado a `front_end_flush`. |
+| ID/EX | `i_insert_bubble` pasa de `load_use_stall` a `load_use_stall \|\| front_end_flush`. |
+| EX | Se instancia `branch_resolver` (`branch_unit`) con los operandos adelantados. |
+| Riesgos | `hazard_detector` recibe `ex_redirect` y entrega `front_end_flush`. |
+
+El PC sigue siendo una instancia de `register`; no se creó un módulo `pc_control` (ver ADR).
+
+### Casos particulares y límites
+
+| Caso | Comportamiento |
+| --- | --- |
+| `jalr` con destino impar | El bit 0 se anula, como exige la ISA. Ejemplo: `jalr x1, 1(x5)` con `x5 = 20` salta a 20. |
+| Un salto en el camino descartado | No redirige: nunca llega a EX con `valid = 1`. Ejemplo: un `jal` justo detrás de un `beq` tomado. |
+| Instrucción ilegal | Está neutralizada por la unidad de control (`is_branch`, `is_jal`, `is_jalr` en 0), así que no puede redirigir. |
+| Salto a la dirección que el fetch ya había pedido (`beq … , 8`) | La búsqueda errónea se anula y se repite: la instrucción se ejecuta **una sola vez**. |
+| Dos saltos tomados consecutivos | Funciona: cada uno paga sus 2 ciclos. |
+| Salto a sí mismo (`jal x0, 0`) | Lazo infinito válido. No ejecuta nada posterior. |
+| Destino no alineado a 4 bytes | Fuera de contrato (sin extensión C). La memoria de programa ignora los 2 bits bajos al indexar, como indica el documento de arquitectura. |
+| Destino fuera de la imagen cargada | **Todavía no se controla.** Lo resuelve la US-4.3 con `N_WORDS`. |
+
+### Verificación
+
+#### Qué se prueba
+
+**`branch_unit_tb`** (18 casos): 
+- `beq` y `bne` con operandos iguales y distintos
+- diferencias en un solo bit
+- destinos hacia adelante y hacia atrás
+- `jal`, `jalr` con bit 0 en uno
+- una instrucción inválida que no debe redirigir.
+
+**`cpu_core_control_hazards_tb`** (13 tests, 83 verificaciones). Cada test es un programa corto, con el resultado esperado calculado a mano:
+
+| Test | Qué demuestra |
+| --- | --- |
+| `beq` tomado, forwarding EX/MEM en `rs1` | El comparador usa el valor adelantado. Las dos instrucciones anuladas no llegan a EX. Penalización de 2 ciclos. |
+| `beq` tomado, forwarding MEM/WB en `rs2` | Ídem con el otro operando y la otra fuente. |
+| `beq` no tomado | Sin penalización: la instrucción siguiente entra a EX sin demora. |
+| `bne` tomado a `PC + 8` y `bne` no tomado | La búsqueda errónea se anula y se repite una sola vez. |
+| Lazo hacia atrás | Dependencia ALU→branch en cada vuelta. El lazo da `15 = 5+4+3+2+1` y la instrucción posterior se ejecuta una sola vez. |
+| Lazo con pausas de `cpu_en` | Mismo resultado con pausas al azar (comportamiento tipo `STEP`). |
+| `lw` seguido de `beq` | Primero el stall y después el flush, sin interferirse. |
+| `jal` con `sw` y `addi` en el camino erróneo | Ni el store ni el registro del camino descartado tienen efecto. |
+| `jalr` con base adelantada y offset impar | Destino correcto y bit 0 anulado (se verifica con el `link` de un `jal` posterior). |
+| Llamada y retorno (`jal` + `jalr`) | El retorno vuelve al lugar correcto. |
+| `jal` en el camino erróneo | No redirige el PC. |
+| Dos `beq` tomados consecutivos | El destino de un salto es otro salto tomado. |
+| `jal` sobre sí mismo | Lazo infinito sin efectos posteriores. |
+
+Además, **tres invariantes se vigilan en todos los tests**:
+
+- Stall y flush nunca coinciden.
+- Tras un flush, `IF/ID` e `ID/EX` quedan como burbuja.
+- Con `cpu_en = 0`, el PC y los latches no cambian.
+
+Para medir qué instrucciones se anularon y cuánto cuesta un salto, el testbench incluye un monitor que cuenta cuántas veces cada PC llega a EX como instrucción válida.
+
+#### Verificaciones adicionales realizadas
+
+Estas comprobaciones se hicieron durante el desarrollo para evitar que los tests pasen por casualidad:
+
+- **Codificaciones:** los programas que arma el testbench se desensamblaron con `objdump` de RISC-V y coinciden con el listado previsto, incluidos todos los destinos de salto.
+- **Prueba diferencial aleatoria:** 3.000 programas generados al azar (dependencias, `lw` seguido de uso, `beq`, `bne`, `jal`, `jalr`), comparados contra un modelo de referencia RV32I en Python. Cada programa se ejecutó en modo continuo y con pausas aleatorias de `cpu_en`. **0 diferencias** en registros y memoria de datos.
+- **Mutaciones:** se introdujeron 14 defectos plausibles (por ejemplo condición `beq`/`bne` invertida, destino con `+4` de más, comparador sin forwarding, limpieza de un latch sin `i_enable`, `jalr` sin anular el bit 0). **Todos fueron detectados** por al menos un testbench. Esto llevó a reforzar dos tests (el del bit 0 de `jalr` y el invariante de pausa).
+
+Estas pruebas son de simulación funcional. No reemplazan los reportes de timing de la etapa E7.

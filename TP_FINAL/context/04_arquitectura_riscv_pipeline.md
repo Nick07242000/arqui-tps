@@ -61,7 +61,7 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
 ├── program_memory           # 1024x32, escritura DU / lectura CPU
 ├── data_memory              # 4 bancos de byte 1024x8, puerto A CPU, puerto B debug
 └── cpu_core
-    ├── pc_control           # PC, next_pc, fetch_stop
+    ├── program_counter      # registro del PC + next_pc_mux (fetch_stop llega en US-4.3)
     ├── control_unit         # decode de opcode/funct3/funct7 (+ ilegal, HALT)
     ├── data_access_checker  # rango y alineacion de loads/stores en MEM
     ├── immediate_generator
@@ -69,6 +69,7 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
     ├── forwarding_unit
     ├── hazard_unit          # stall load-use y flush
     ├── alu
+    ├── branch_unit          # condicion y destino de branch/jal/jalr en EX
     ├── halt_controller      # halting, done, done_reason
     ├── if_id_register       # latch IF/ID (valid, pc)
     ├── id_ex_register       # latch ID/EX
@@ -77,7 +78,7 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
     └── perf_counters        # cycles, retired
 ```
 
-Los nombres siguen la tabla del roadmap (§2); `halt_controller`, `hazard_unit` y `pc_control` pueden fusionarse en un solo módulo si las interfaces siguen siendo explícitas. `pipeline_registers` se materializa en cuatro módulos, uno por latch. Hasta US-3.3 el PC es una instancia de `register` dentro de `cpu_core`.
+Los nombres siguen la tabla del roadmap (§2); `halt_controller` y `hazard_unit` pueden fusionarse en un solo módulo si las interfaces siguen siendo explícitas. `pipeline_registers` se materializa en cuatro módulos, uno por latch. El PC es una instancia de `register` (`program_counter`) con un `mux` de próximo PC dentro de `cpu_core`; no se crea `pc_control` (ADR-25).
 
 ### 1.2 Parámetros globales
 
@@ -216,7 +217,7 @@ Cada latch tiene `valid`. Una **burbuja** es un latch con `valid=0`; **ninguna**
 
 Tras reset todos los `valid` son 0 («etapa vacía»). La distinción «burbuja» vs «vacía» no se almacena: ambas son `valid=0` (suficiente para el requisito de que el pipeline esté vacío al terminar).
 
-Al insertar una burbuja el latch se limpia por completo, por lo que `GET_PIPELINE` la muestra con `pc` e `instr` en cero. El cliente debe decidir por `valid`, no por esos valores.
+La burbuja que inserta un stall o un flush deja `ID/EX` limpio en el momento de la inserción. Una etapa con `valid = 0` puede conservar después campos no nulos (por ejemplo, `IF/ID.instr` sale de la memoria de programa y no se limpia). El cliente decide siempre por `valid` y no interpreta los demás campos de una etapa inválida (ADR-29).
 
 ### 3.1 Word de control (`ctrl`, 16 bits): formato de `GET_PIPELINE`
 
@@ -842,7 +843,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 
 | Señal | Productor → Consumidor | Ancho | Significado |
 | --- | --- | --- | --- |
-| `imem_addr` | `pc_control` → `program_memory` | 10 | `pc[11:2]` |
+| `imem_addr` | `cpu_core` (`program_counter`) → `program_memory` | 10 | `pc[11:2]` |
 | `imem_ce` | `cpu_core` → `program_memory` | 1 | `cpu_en && !stall` |
 | `imem_rdata` | `program_memory` → `cpu_core` | 32 | Se registra como `IF/ID.instr` |
 | `dmem_addr` | `cpu_core` (`EX/MEM.result[11:2]`) → `data_memory` | 10 | Índice de palabra |
@@ -854,11 +855,11 @@ cycle 12   pc=0x00000014   state=PAUSED
 
 | Señal | Productor → Consumidor | Ancho | Significado |
 | --- | --- | --- | --- |
-| `stall` | `hazard_unit` → `pc_control`, `IF/ID`, `ID/EX` | 1 | Load-use detectado en ID |
-| `redirect` | EX → `pc_control`, `hazard_unit` | 1 | Branch/jump tomado |
-| `redirect_pc` | EX → `pc_control` | 32 | Destino |
+| `stall` | `hazard_unit` → `program_counter`, `IF/ID`, `ID/EX` | 1 | Load-use detectado en ID |
+| `redirect` | `branch_unit` (EX) → `next_pc_mux`, `hazard_unit` | 1 | Branch/jump tomado |
+| `redirect_pc` | `branch_unit` (EX) → `next_pc_mux` | 32 | Destino |
 | `halt_commit` | EX → `halt_controller` | 1 | `HALT` válido en EX |
-| `flush_front` | `hazard_unit` → `IF/ID`, `ID/EX` | 1 | `redirect \|\| halt_commit` |
+| `front_end_flush` | `hazard_unit` → `IF/ID`, `ID/EX` | 1 | `redirect \|\| halt_commit` (hoy solo `redirect`; `halt_commit` se suma en US-4.3) |
 | `fwd_a`, `fwd_b` | `forwarding_unit` → EX | 2+2 | `00` ID/EX · `01` EX/MEM · `10` WB |
 | `wb_data` | WB → `register_file`, EX (forward) | 32 | Resultado final de la instrucción en WB |
 | `wb_we`, `wb_rd` | WB → `register_file` | 1, 5 | `memwb.valid && reg_write && rd≠0` |
@@ -894,6 +895,12 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-21 | Bit `access_out_of_range` en `MEM/WB` | Recalcular el rango en WB; no zerar el load fuera de rango | El rango se verifica en MEM pero el load se resuelve en WB | Usa el bit 6 reservado de `ctrl8` de `MEM/WB` |
 | ADR-22 | Burbuja en `ID/EX` con `i_insert_bubble`, que limpia el latch completo | Solo `enable`; limpiar solo `valid` y controles | Un `enable` no alcanza: el load debe avanzar a `EX/MEM` mientras `ID/EX` recibe un vacío | `register_id_ex` tiene una entrada más, reutilizable para el flush de la US-3.3 |
 | ADR-23 | Forwarding por coincidencia de número de registro, sin `uses_rs` | Hacer viajar `uses_rs1/2` por los latches | Si el campo no es una fuente el valor adelantado se ignora; solo el stall necesita `uses_rs` | Cero FF extra |
+| ADR-24 | `branch_unit` combinacional que resuelve saltos en EX | Lógica inline en `cpu_core` | Testbench propio con casos límite; `cpu_core` queda como cableado | Un módulo y un testbench más |
+| ADR-25 | Próximo PC con `mux` en `cpu_core`, sin módulo `pc_control` | Módulo `pc_control` | Una sola señal de selección (`ex_redirect`); reutiliza `mux` | Reevaluar en US-4.3 si `fetch_stop` suma lógica |
+| ADR-26 | El flush se genera en `hazard_unit` (`i_ex_redirect` → `o_flush_front`) | `cpu_core` usa `ex_redirect` directo | Un solo lugar para stall y flush; US-4.3 suma `halt_commit` ahí | Hoy es una conexión directa |
+| ADR-27 | Flush de `IF/ID` con `i_insert_bubble` (misma semántica que `ID/EX`) | Entrada `i_flush` propia | Mismo nombre para el mismo comportamiento; no altera el pipeline con `cpu_en = 0` | `IF/ID.instr` no se limpia (sale de la BRAM) |
+| ADR-28 | Destino de `jalr` = resultado de la ALU con el bit 0 en 0 | Segundo sumador en `branch_unit` | Evita un sumador de 32 bits; respeta el forwarding | Camino `forwarding → ALU → redirect → PC` candidato a crítico (E7) |
+| ADR-29 | Una etapa con `valid = 0` está vacía: decide `valid`, no el contenido | Forzar ceros (burbuja si `!if_id_valid` y enmascarar `instr`) | Sin lógica extra solo para presentación; la interpretación es del cliente | `GET_PIPELINE` puede traer campos no nulos con `valid = 0` |
 
 ---
 
@@ -921,7 +928,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | --- | --- |
 | Pipeline de 5 etapas con latches | `if_id_register`, `id_ex_register`, `ex_mem_register`, `mem_wb_register`, `cpu_core` |
 | ISA enumerada | `control_unit`, `immediate_generator`, `alu`, `register_file`, `data_memory` |
-| Riesgos de datos/control/estructurales | `hazard_unit`, `forwarding_unit`, `pc_control`, memorias separadas |
+| Riesgos de datos/control/estructurales | `hazard_unit`, `forwarding_unit`, `branch_unit`, memorias separadas |
 | 32 registros, latches y memoria de datos por UART | `debug_unit`, `register_file` (puerto debug), `dbg_pipe`, `data_memory` (puerto B) |
 | Programación dinámica por UART | `debug_unit`, `program_memory` (puerto de escritura) |
 | HALT y vaciado | `halt_controller`, `control_unit` |

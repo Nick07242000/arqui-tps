@@ -32,8 +32,13 @@ module cpu_core #(
     wire [4:0]  wb_register_write_addr;
     wire [31:0] wb_register_write_data;
 
-    // Resultado de Riesgos de datos, consumido por IF, ID y EX
+    // Cambio de flujo resuelto en EX, consumido por IF y por la unidad de riesgos
+    wire        ex_redirect;
+    wire [31:0] ex_redirect_pc;
+
+    // Resultado de la unidad de riesgos, consumido por IF, ID y EX
     wire        load_use_stall;
+    wire        front_end_flush;
     wire [1:0]  ex_forward_a_select;
     wire [1:0]  ex_forward_b_select;
 
@@ -43,16 +48,24 @@ module cpu_core #(
     // =========================================================================
     wire [31:0] if_pc;
     wire [31:0] if_pc_plus_4 = if_pc + 32'd4;
+    wire [31:0] if_next_pc;
     wire        if_is_valid  = 1'b1;       // US-4.3: dependera del fin de la imagen
 
     // En un stall se congelan PC, lectura de imem e IF/ID; el resto avanza
     wire        front_end_enable = i_cpu_en && !load_use_stall;
 
+    // El PC sigue en secuencia salvo que EX redirija el flujo
+    mux #(.DATA_WIDTH(32), .INPUT_COUNT(2)) next_pc_mux (
+        .i_inputs ({ex_redirect_pc, if_pc_plus_4}),
+        .i_select (ex_redirect),
+        .o_output (if_next_pc)
+    );
+
     register #(.DATA_WIDTH(32)) program_counter (
         .i_clk    (i_clk),
         .i_reset  (i_cpu_reset),
         .i_enable (front_end_enable),
-        .i_data   (if_pc_plus_4),
+        .i_data   (if_next_pc),
         .o_data   (if_pc)
     );
 
@@ -65,13 +78,14 @@ module cpu_core #(
     wire [31:0] if_id_instruction = i_imem_read_data;
 
     register_if_id if_id_latch (
-        .i_clk    (i_clk),
-        .i_reset  (i_cpu_reset),
-        .i_enable (front_end_enable),
-        .i_valid  (if_is_valid),
-        .i_pc     (if_pc),
-        .o_valid  (if_id_valid),
-        .o_pc     (if_id_pc)
+        .i_clk           (i_clk),
+        .i_reset         (i_cpu_reset),
+        .i_enable        (front_end_enable),
+        .i_insert_bubble (front_end_flush),
+        .i_valid         (if_is_valid),
+        .i_pc            (if_pc),
+        .o_valid         (if_id_valid),
+        .o_pc            (if_id_pc)
     );
 
 
@@ -166,7 +180,7 @@ module cpu_core #(
         .i_clk              (i_clk),
         .i_reset            (i_cpu_reset),
         .i_enable           (i_cpu_en),
-        .i_insert_bubble    (load_use_stall),
+        .i_insert_bubble    (load_use_stall || front_end_flush),
         .i_valid            (if_id_valid),
         .i_pc               (if_id_pc),
         .i_instruction      (if_id_instruction),
@@ -266,6 +280,22 @@ module cpu_core #(
         .i_inputs ({ex_return_address, ex_alu_result}),
         .i_select (ex_result_is_return_address),
         .o_output (ex_result)
+    );
+
+    // ---- Resolucion de branches y jumps -------------------------------------
+    branch_unit branch_resolver (
+        .i_valid       (id_ex_valid),
+        .i_is_branch   (id_ex_is_branch),
+        .i_is_jal      (id_ex_is_jal),
+        .i_is_jalr     (id_ex_is_jalr),
+        .i_funct3      (id_ex_funct3),
+        .i_pc          (id_ex_pc),
+        .i_immediate   (id_ex_immediate),
+        .i_rs1_value   (ex_rs1_value),
+        .i_rs2_value   (ex_rs2_value),
+        .i_alu_result  (ex_alu_result),
+        .o_redirect    (ex_redirect),
+        .o_redirect_pc (ex_redirect_pc)
     );
 
     // ---- Latch EX/MEM -------------------------------------------------------
@@ -391,7 +421,7 @@ module cpu_core #(
 
 
     // =========================================================================
-    // Riesgos de datos
+    // Riesgos de datos y de control
     // =========================================================================
     hazard_unit hazard_detector (
         .i_if_id_valid    (if_id_valid),
@@ -402,7 +432,9 @@ module cpu_core #(
         .i_id_ex_valid    (id_ex_valid),
         .i_id_ex_mem_read (id_ex_mem_read),
         .i_id_ex_rd_addr  (id_ex_rd_addr),
-        .o_stall          (load_use_stall)
+        .i_ex_redirect    (ex_redirect),
+        .o_stall          (load_use_stall),
+        .o_flush_front    (front_end_flush)
     );
 
     forwarding_unit forwarding_selector (

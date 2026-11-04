@@ -364,3 +364,174 @@ El forwarding compara `rs1`/`rs2` de la instrucción en EX contra el destino de 
 ### Consecuencias
 
 - `store_data` de instrucciones que no son stores puede mostrar un valor adelantado sin significado, sin efectos.
+
+## ADR - Módulo de resolución de saltos
+
+### Contexto
+
+La etapa EX debe decidir si un `beq`, `bne`, `jal` o `jalr` cambia el flujo y hacia dónde. La decisión depende de la condición, del tipo de salto, de la validez de la instrucción y del destino.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Escribir la lógica directamente en `cpu_core`, junto a la ALU. |
+| **A** | **Un módulo `branch_unit` combinacional con su propio testbench.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Se prueba por separado con casos límite (igualdad en un solo bit, destinos negativos, bit 0 de `jalr`) sin armar un programa completo.
+- `cpu_core` conserva su papel de cableado entre etapas.
+- La condición y el destino quedan juntos y fáciles de leer en pocas líneas.
+
+### Consecuencias
+
+- Un módulo y un testbench más.
+- La interfaz recibe `i_valid`: una burbuja en EX puede traer controles encendidos y no debe redirigir.
+
+## ADR - Selección del próximo PC sin módulo `pc_control`
+
+### Contexto
+
+El documento de arquitectura (§1.1) lista un módulo `pc_control`. Con la US-3.3 el PC debe elegir entre `PC + 4` y el destino del salto.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Crear `pc_control` con el registro del PC, el mux del próximo PC y la lógica de stall. |
+| **A** | **Mantener el PC como instancia de `register` y agregar un `mux` de 2 entradas en `cpu_core`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Reutiliza el `mux` genérico, igual que el resto de `cpu_core`.
+- La selección es una sola señal (`ex_redirect`); un módulo nuevo solo envolvería un registro y un mux.
+- Los nombres del roadmap son sugeridos, no obligatorios.
+
+### Consecuencias
+
+- `pc_control` no se materializa. Si la US-4.3 necesita más lógica de fetch (`fetch_stop`, límite `N_WORDS`), conviene reevaluar la extracción.
+- El documento de arquitectura (§1.1) debe actualizarse.
+
+## ADR - Generación del flush en `hazard_unit`
+
+### Contexto
+
+El flush por salto tomado afecta a `IF/ID` e `ID/EX`, igual que el stall afecta al front-end. Hay que decidir dónde se genera la señal.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | `cpu_core` usa directamente `ex_redirect` como señal de flush. |
+| **A** | **`hazard_unit` recibe `i_ex_redirect` y entrega `o_flush_front`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Coincide con el documento de arquitectura: `flush_front` sale de `hazard_unit` (§11.5).
+- Deja en un solo módulo las dos señales que controlan el front-end (stall y flush).
+- La US-4.3 suma la condición de `HALT` en este mismo punto, sin tocar `cpu_core`.
+
+### Consecuencias
+
+- Hoy `o_flush_front` es una conexión directa de `i_ex_redirect`.
+- Los testbenches existentes de `hazard_unit` deben conectar la entrada nueva.
+- Stall y flush no coinciden nunca (el stall exige un `load` en EX y el flush un salto). Los testbenches lo vigilan.
+
+## ADR - Flush de `IF/ID` con `i_insert_bubble`
+
+### Contexto
+
+`ID/EX` ya tiene una entrada `i_insert_bubble` que limpia el latch completo si el CPU avanza. `IF/ID` también necesita anularse cuando se toma un salto.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Entrada distinta (`i_flush`) con semántica propia. |
+| **A** | **La misma entrada `i_insert_bubble`, con la misma semántica que en `ID/EX`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Un mismo nombre para un mismo comportamiento en ambos latches: se limpia por completo, y solo si el front-end avanza.
+- Es consistente con el ADR de inserción de burbujas en `ID/EX`.
+- Condicionar a `i_enable` evita alterar el pipeline mientras el CPU está pausado (modo `STEP`).
+
+### Consecuencias
+
+- `register_if_id` tiene una entrada más; su testbench debe conectarla.
+- `IF/ID` no guarda la instrucción: sale directo de la memoria de programa y el flush no la limpia. Se resuelve por la regla del ADR siguiente: el cliente decide por `valid`.
+
+## ADR - Destino de `jalr` calculado por la ALU
+
+### Contexto
+
+El destino de `jalr` es `rs1 + imm` con el bit 0 anulado. `branch` y `jal` usan `PC + imm`, que requiere un sumador dedicado.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Un segundo sumador dentro de `branch_unit` para `rs1 + imm`. |
+| **A** | **Reutilizar el resultado de la ALU (`rs1 + imm`) y anular el bit 0 en `branch_unit`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- La unidad de control ya configura la ALU para `jalr` (suma con el inmediato como segundo operando).
+- Evita un sumador de 32 bits.
+- La ALU ya recibe `rs1` con forwarding, así que el destino también lo respeta.
+
+### Consecuencias
+
+- `branch_unit` recibe `i_alu_result`, que solo usa `jalr`.
+- El camino `forwarding → ALU → redirect → mux del PC` es candidato a camino crítico. Se revisa en la etapa E7.
+
+## ADR - Contenido de una etapa invalidada: decide `valid`
+
+### Contexto
+
+Tras un flush, `IF/ID` queda con `valid = 0` pero con la `instr` anulada (sale de la memoria de programa), y un ciclo después `ID/EX` queda con `valid = 0` arrastrando esa instrucción y sus controles. El ADR de burbujas en `ID/EX` menciona que una burbuja se ve "vacía y en ceros". Hay que decidir si esa visualización debe garantizarse.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| **0** | **El cliente de debug decide por `valid`. Una etapa con `valid = 0` está vacía y el resto de sus campos son irrelevantes.** |
+| A | Garantizar ceros: insertar burbuja en `ID/EX` también cuando `!if_id_valid` y enmascarar `instr` de `IF/ID` con `valid` al armar `dbg_pipe`. |
+
+### Decisión
+
+**Opción 0.**
+
+### Motivos
+
+- Un flush invalida una instrucción apagando sus permisos de escritura; el resto de las señales pasan a ser irrelevantes. Limpiar los datos no agrega valor funcional.
+- La opción A suma lógica combinacional (términos de burbuja y enmascaramiento) solo para una presentación estética, con costo de recursos y posible retardo en el camino crítico.
+- Interpretar el estado es responsabilidad del software de depuración, y el documento de arquitectura ya prevé que el cliente use `valid`.
+
+### Consecuencias
+
+- Sin cambios de RTL.
+- `GET_PIPELINE` puede traer campos no nulos en etapas con `valid = 0`. La CLI no debe desensamblar ni mostrar esos campos.
+- El ADR de burbujas en `ID/EX` sigue vigente para la burbuja insertada por stall o flush, pero no garantiza que la etapa se vea en ceros ciclos después.
+- Hay que ajustar la redacción del documento de arquitectura (§3) y fijar la regla en la especificación de la CLI (E6).

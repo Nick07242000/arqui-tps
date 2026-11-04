@@ -10,7 +10,9 @@ module tb_hazard_unit;
     reg        id_ex_valid;
     reg        id_ex_mem_read;
     reg  [4:0] id_ex_rd_addr;
+    reg        ex_redirect;
     wire       stall;
+    wire       flush_front;
 
     integer error_count = 0;
 
@@ -23,10 +25,13 @@ module tb_hazard_unit;
         .i_id_ex_valid    (id_ex_valid),
         .i_id_ex_mem_read (id_ex_mem_read),
         .i_id_ex_rd_addr  (id_ex_rd_addr),
-        .o_stall          (stall)
+        .i_ex_redirect    (ex_redirect),
+        .o_stall          (stall),
+        .o_flush_front    (flush_front)
     );
 
     // Estado base: ID lee x5 y x6; EX tiene un load valido a x5 (hay dependencia)
+    // y no hay salto en EX
     task set_load_use_on_rs1;
     begin
         if_id_valid    = 1'b1;
@@ -37,6 +42,7 @@ module tb_hazard_unit;
         id_ex_valid    = 1'b1;
         id_ex_mem_read = 1'b1;
         id_ex_rd_addr  = 5'd5;
+        ex_redirect    = 1'b0;
     end
     endtask
 
@@ -45,6 +51,18 @@ module tb_hazard_unit;
         #1;
         if (stall !== expected_stall) begin
             $display("[FAIL] %0s: stall=%b (esperado %b)", case_name, stall, expected_stall);
+            error_count = error_count + 1;
+        end else begin
+            $display("[PASS] %0s", case_name);
+        end
+    end
+    endtask
+
+    task expect_flush(input [8*48-1:0] case_name, input expected_flush);
+    begin
+        #1;
+        if (flush_front !== expected_flush) begin
+            $display("[FAIL] %0s: flush_front=%b (esperado %b)", case_name, flush_front, expected_flush);
             error_count = error_count + 1;
         end else begin
             $display("[PASS] %0s", case_name);
@@ -82,6 +100,19 @@ module tb_hazard_unit;
 
         set_load_use_on_rs1; id_ex_valid = 1'b0;
         expect_stall("burbuja en ID/EX", 1'b0);
+
+        // ---- Flush por cambio de flujo -----------------------------------------
+        set_load_use_on_rs1; id_ex_mem_read = 1'b0; ex_redirect = 1'b1;
+        expect_flush("salto tomado en EX: flush", 1'b1);
+
+        set_load_use_on_rs1; id_ex_mem_read = 1'b0; ex_redirect = 1'b1;
+        expect_stall("salto tomado en EX: sin stall", 1'b0);
+
+        set_load_use_on_rs1; id_ex_mem_read = 1'b0;
+        expect_flush("sin salto en EX: sin flush", 1'b0);
+
+        set_load_use_on_rs1;
+        expect_flush("load-use no genera flush", 1'b0);
 
         if (error_count == 0) $display("hazard_unit_tb: TODOS LOS CASOS PASARON");
         else                  $display("hazard_unit_tb: %0d CASOS FALLARON", error_count);
