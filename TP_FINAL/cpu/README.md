@@ -907,7 +907,7 @@ La idea es la de una línea de montaje: mientras una instrucción se ejecuta en 
 - Todo el avance del pipeline controlado por una señal de habilitación (`i_cpu_en`), sin tocar el reloj.
 - Un testbench que registra, ciclo a ciclo, qué instrucción ocupa cada etapa y comprueba que cada escritura ocurre una sola vez.
 
-Esta versión **no resuelve riesgos** de datos ni de control: eso llega en US-3.2 y US-3.3 (ver [Alcance](#alcance-de-esta-versión)).
+Por ahora **no se resuelven riesgos** de datos ni de control.
 
 ### Vista general
 
@@ -1046,8 +1046,6 @@ El parámetro `MEM_ADDR_WIDTH` (por defecto 10) fija la profundidad de ambas mem
 | `HALT` y fin de la imagen | Se decodifica, pero el PC sigue avanzando | US-4.3 |
 | Debug Unit | `i_cpu_en` e `i_cpu_reset` los maneja el testbench | E5 |
 
-**Regla para los programas de prueba hasta US-3.2:** productor y consumidor deben estar separados por al menos 3 instrucciones (o por `nop`). A distancia 3, el banco de registros ya entrega el dato de WB a la lectura de ID del mismo ciclo (*bypass*), por lo que ese caso funciona sin lógica extra.
-
 ### Verificación
 
 El testbench `cpu_core_tb` hace de Debug Unit: carga el programa por el puerto de escritura de `program_memory`, aplica reset y maneja `i_cpu_en`.
@@ -1064,7 +1062,7 @@ El testbench `cpu_core_tb` hace de Debug Unit: carga el programa por el puerto d
 | Escrituras una sola vez | Se cuentan las escrituras de registro y de memoria por instrucción: ninguna supera 1 y el total coincide con el esperado (32 y 6 en el escenario A). |
 | Sin riesgos, resultados correctos | Los 32 registros y 4 palabras de memoria se comparan con un modelo de referencia en Python, con el programa ensamblado con binutils RISC-V. |
 
-Resultado: **PASS (0 errores)**. Para comprobar que el testbench detecta fallos se inyectaron 7 errores en el RTL (store sin habilitación, load fuera de rango sin poner 0, store fuera de rango sin suprimir, `rd` mal conectado, control desalineado, `valid` forzado, latch sin reset); los 7 fueron detectados. El RTL además sintetiza sin errores con `synth_gowin` de Yosys.
+ Para comprobar que el testbench detecta fallos se inyectaron 7 errores en el RTL (store sin habilitación, load fuera de rango sin poner 0, store fuera de rango sin suprimir, `rd` mal conectado, control desalineado, `valid` forzado, latch sin reset); los 7 fueron detectados.
 
 Fragmento de la traza (cada columna indica el índice de la instrucción que ocupa la etapa; `--` es una etapa vacía):
 
@@ -1077,23 +1075,13 @@ Fragmento de la traza (cada columna indica el índice de la instrucción que ocu
 | 4 | 4 | 3 | 2 | 1 | 0 |
 | 5 | 5 | 4 | 3 | 2 | 1 |
 
-Para ejecutarlo con Icarus Verilog, desde la carpeta con los fuentes:
-
-```bash
-iverilog -g2012 -I . -o cpu_core_tb \
-    cpu_core_tb.v cpu_core.v if_id_register.v id_ex_register.v ex_mem_register.v mem_wb_register.v \
-    program_memory.v data_memory.v control_unit.v immediate_generator.v registers.v register.v \
-    mux.v alu.v data_access_checker.v store_data_formatter.v load_data_extender.v
-vvp cpu_core_tb
-```
-
 ### Decisiones de diseño
 
 | Decisión | Motivo | Consecuencia |
 | --- | --- | --- |
-| Cuatro módulos de latch (uno por frontera) en lugar de un único `pipeline_registers` | Cada latch tiene una interfaz corta y propia, fácil de leer y de ampliar | La arquitectura (`04`) los lista como un solo módulo; se materializa en cuatro |
+| Cuatro módulos de latch (uno por frontera) en lugar de un único `pipeline_registers` | Cada latch tiene una interfaz corta y propia, fácil de leer y de ampliar | La arquitectura los lista como un solo módulo; se materializa en cuatro |
 | Señales de control con nombre en los latches, no la palabra `ctrl` de 16 bits | Se entiende qué hace cada cable sin decodificar posiciones de bits | El empaquetado del formato de `GET_PIPELINE` se hace en E5, al armar `dbg_pipe` |
-| Bit `access_out_of_range` en MEM/WB | El rango se verifica en MEM, pero el load devuelve 0 recién en WB | Usa el bit 6, hoy reservado, de `ctrl8` en `04` §3.1: actualizar ese documento |
+| Bit `access_out_of_range` en MEM/WB | El rango se verifica en MEM, pero el load devuelve 0 recién en WB | Usa el bit 6, hoy reservado, de `ctrl8` |
 | Reset de todos los campos de los latches, no solo de `valid` | Las consultas de depuración tras un reset muestran ceros, no restos de la ejecución anterior | Costo despreciable: el reset síncrono es propio de los flip-flops de la FPGA |
 | `cpu_core` ya expone `i_debug_reg_addr` / `o_debug_reg_data` | Reutiliza el puerto de debug del banco de registros y deja lista la consulta de `GET_REGS` | Ninguna |
 
@@ -1154,7 +1142,7 @@ flowchart LR
 - **Nunca adelanta el registro `x0`**, que siempre vale cero.
 - **No adelanta desde `EX/MEM` si esa instrucción es un `load`**: en ese momento el campo `result` es solo la dirección, el dato todavía no se leyó.
 - Si `EX/MEM` y `MEM/WB` escriben el mismo registro, **gana `EX/MEM`** porque es la instrucción más reciente.
-- El forwarding se aplica a ambos operandos, por lo que también alcanza al **dato de un store** y a los operandos que usarán los saltos en la US-3.3.
+- El forwarding se aplica a ambos operandos, por lo que también alcanza al **dato de un store** y a los operandos que usarán los saltos.
 
 **Interfaz de `forwarding_unit`**
 
@@ -1267,7 +1255,7 @@ Cada test de integración compara registros, memoria y tres contadores: **stalls
 | Stall seguido de forwarding y bypass del banco | 1 stall, 3 valores correctos |
 | `lb` y `lbu` con consumidor inmediato | 2 stalls, extensión de signo y de ceros correctas |
 
-**Validación de los tests.** Para comprobar que los tests detectan errores y no solo "pasan", se probaron 12 versiones del diseño con una falla introducida a propósito: sin forwarding desde `EX/MEM`, sin forwarding desde `MEM/WB`, prioridad invertida, forwarding de `x0`, sin stall, stall que ignora `uses_rs`, store sin forwarding, stall que no congela el PC, stall que no congela la memoria de programa, stall sin burbuja, sin la guarda de load y sin la guarda de `IF/ID` válido. **Los 12 fueron detectados** por al menos un test.
+Para comprobar que los tests detectan errores se probaron 12 versiones del diseño con una falla introducida a propósito: sin forwarding desde `EX/MEM`, sin forwarding desde `MEM/WB`, prioridad invertida, forwarding de `x0`, sin stall, stall que ignora `uses_rs`, store sin forwarding, stall que no congela el PC, stall que no congela la memoria de programa, stall sin burbuja, sin la guarda de load y sin la guarda de `IF/ID` válido. **Los 12 fueron detectados**.
 
 ## Riesgos de control
 
@@ -1303,7 +1291,7 @@ Eso es un *riesgo de control*, y hay que responder tres preguntas:
 | Destino de `jalr` | `(rs1 + imm)` calculado por la ALU, con el bit 0 forzado a cero (regla de la ISA). |
 | Reloj | Sin cambios. Todo se habilita con `cpu_en`; el flush solo actúa en ciclos habilitados. |
 
-El detalle y las alternativas descartadas están en `05_ADRs_US-3.3.md`.
+El detalle y las alternativas descartadas están en los ADRs.
 
 ### Cómo funciona
 
@@ -1539,6 +1527,6 @@ Estas comprobaciones se hicieron durante el desarrollo para evitar que los tests
 
 - **Codificaciones:** los programas que arma el testbench se desensamblaron con `objdump` de RISC-V y coinciden con el listado previsto, incluidos todos los destinos de salto.
 - **Prueba diferencial aleatoria:** 3.000 programas generados al azar (dependencias, `lw` seguido de uso, `beq`, `bne`, `jal`, `jalr`), comparados contra un modelo de referencia RV32I en Python. Cada programa se ejecutó en modo continuo y con pausas aleatorias de `cpu_en`. **0 diferencias** en registros y memoria de datos.
-- **Mutaciones:** se introdujeron 14 defectos plausibles (por ejemplo condición `beq`/`bne` invertida, destino con `+4` de más, comparador sin forwarding, limpieza de un latch sin `i_enable`, `jalr` sin anular el bit 0). **Todos fueron detectados** por al menos un testbench. Esto llevó a reforzar dos tests (el del bit 0 de `jalr` y el invariante de pausa).
+- **Mutaciones:** se introdujeron 14 defectos plausibles (por ejemplo condición `beq`/`bne` invertida, destino con `+4` de más, comparador sin forwarding, limpieza de un latch sin `i_enable`, `jalr` sin anular el bit 0). **Todos fueron detectados**.
 
 Estas pruebas son de simulación funcional. No reemplazan los reportes de timing de la etapa E7.
