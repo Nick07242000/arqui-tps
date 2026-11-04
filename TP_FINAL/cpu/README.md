@@ -1530,3 +1530,140 @@ Estas comprobaciones se hicieron durante el desarrollo para evitar que los tests
 - **Mutaciones:** se introdujeron 14 defectos plausibles (por ejemplo condición `beq`/`bne` invertida, destino con `+4` de más, comparador sin forwarding, limpieza de un latch sin `i_enable`, `jalr` sin anular el bit 0). **Todos fueron detectados**.
 
 Estas pruebas son de simulación funcional. No reemplazan los reportes de timing de la etapa E7.
+
+## Riesgos estructurales
+
+### De qué se trata
+
+Un **riesgo estructural** aparece cuando dos partes del procesador necesitan el mismo recurso físico en el mismo ciclo de reloj y el recurso no puede atender a ambas. Un ejemplo clásico: si el programa y los datos viviesen en una sola memoria, la etapa IF (que busca la siguiente instrucción) y la etapa MEM (que lee o escribe un dato) querrían usarla a la vez, y una de las dos tendría que esperar o, peor, perder su acceso.
+
+Esta historia de usuario responde tres preguntas:
+
+1. ¿Qué recursos comparten las etapas del pipeline y la Debug Unit? (inventario)
+2. ¿Cómo evita el diseño que compitan? (resolución)
+3. ¿Cómo sabemos que funciona? (pruebas)
+
+**Resultado en una línea:** el diseño ya elimina los conflictos *por construcción* (memorias separadas, puertos independientes, bypass en el banco de registros), por lo que esta historia no agrega hardware nuevo: documenta el contrato de acceso a cada recurso y lo demuestra con pruebas, incluyendo fallas inyectadas a propósito para comprobar que las pruebas realmente detectan el problema.
+
+### Inventario de recursos compartidos
+
+| Recurso | Quiénes lo usan en el mismo ciclo | Cómo se evita el conflicto | Módulo |
+| --- | --- | --- | --- |
+| **Memoria de instrucciones y de datos** | IF (busca instrucción) y MEM (load/store) | Son dos memorias físicamente separadas (arquitectura Harvard) | `program_memory`, `data_memory` |
+| **Banco de registros: escribir y leer el mismo registro** | WB escribe un registro mientras ID lee ese mismo registro | *Bypass* interno: si el registro que se lee es el que se está escribiendo, la lectura devuelve el dato nuevo | `registers` |
+| **Banco de registros: cantidad de puertos** | ID lee dos operandos y WB escribe uno | Dos puertos de lectura y uno de escritura. Solo una instrucción está en WB por ciclo | `registers` |
+| **Memoria de programa: CPU y Debug Unit** | El CPU lee (IF) y la Debug Unit escribe (carga de programa) | Puertos separados de lectura y escritura. La lectura solo ocurre si el CPU avanza, y la Debug Unit solo escribe con el CPU detenido | `program_memory`, `cpu_core` |
+| **Memoria de datos: CPU y Debug Unit** | El CPU lee/escribe (MEM) y la Debug Unit consulta | El CPU usa el puerto A; la Debug Unit usa un puerto B **de solo lectura** con su propio registro de salida | `data_memory` |
+| **Banco de registros: consulta de debug** | ID lee operandos y la Debug Unit lee los 32 registros | Puerto de debug independiente, solo lectura | `registers` |
+
+**Recursos que parecen compartidos pero no lo son.** Se revisaron y no generan conflicto:
+
+- **ALU:** la usa solo la instrucción que está en EX, y en EX hay una única instrucción por ciclo. Los saltos tampoco compiten por ella: `branch` y `jal` calculan su destino con un sumador propio (`PC + inmediato`) y el `beq`/`bne` usa un comparador propio dentro de `branch_unit`.
+- **Sumadores de PC:** `PC + 4` de IF, `PC + 4` de la dirección de retorno en EX y `PC + inmediato` son tres sumadores distintos.
+- **Registros de segmentación (latches):** cada latch tiene un único escritor, la etapa anterior.
+
+### Cómo se resuelve cada conflicto
+
+#### Fetch y acceso a datos en el mismo ciclo
+
+Mientras un `lw` o un `sw` está en MEM, la etapa IF sigue buscando la siguiente instrucción. Como cada una usa su propia memoria, ambas ocurren en paralelo y ninguna espera. No hace falta stall ni arbitraje.
+
+Un detalle útil de la memoria de datos: lee y escribe en el mismo flanco de reloj, y **una lectura que coincide con una escritura a la misma palabra devuelve el valor anterior**. Esto es coherente con el pipeline, porque un `store` y un `load` nunca están en MEM en el mismo ciclo: si un `lw` viene justo después de un `sw`, el `sw` escribe en su ciclo MEM y el `lw` lee en el ciclo siguiente, ya con el dato nuevo.
+
+#### WB escribe y ID lee el mismo registro
+
+Cuando una instrucción llega a WB y escribe su resultado, una instrucción tres lugares más atrás puede estar justo en ID leyendo ese mismo registro:
+
+| Ciclo | 1 | 2 | 3 | 4 | 5 |
+| --- | --- | --- | --- | --- | --- |
+| `addi x1, x0, 7` | IF | ID | EX | MEM | **WB** (escribe `x1`) |
+| `nop` | | IF | ID | EX | MEM |
+| `nop` | | | IF | ID | EX |
+| `add x2, x1, x1` | | | | IF | **ID** (lee `x1`) |
+
+Sin ayuda, la lectura vería el valor viejo de `x1`, porque la escritura se completa recién al final del ciclo. El banco de registros lo resuelve internamente: si la dirección que se lee coincide con la que se está escribiendo, entrega directamente el dato de escritura. Esta es la tercera distancia de dependencia del diseño; las distancias 1 y 2 las cubre el forwarding (US-3.2). El registro `x0` queda excluido: nunca se escribe ni se adelanta.
+
+#### Debug Unit y CPU
+
+La Debug Unit toca tres recursos del CPU. En cada uno, el diseño garantiza que **consultar no modifica nada** y que **escribir solo ocurre cuando el CPU no avanza**.
+
+| Acceso de la Debug Unit | Puerto usado | Qué garantiza el hardware |
+| --- | --- | --- |
+| Leer los 32 registros | Puerto de debug del banco de registros | Solo lectura, sin bypass: no altera el estado |
+| Leer la memoria de datos | Puerto B de `data_memory` | Solo lectura; tiene su propio registro de salida, así que no pisa el dato que el CPU ya tiene en el suyo |
+| Escribir la memoria de programa | Puerto de escritura de `program_memory` | Con el CPU sin avanzar, la lectura de instrucciones está deshabilitada y la instrucción ya registrada en IF/ID no cambia |
+
+#### Contrato de acceso: qué se permite en cada estado
+
+El hardware tolera los accesos de la tabla anterior, pero que un acceso sea *físicamente* inofensivo no alcanza: escribir el programa mientras el CPU corre lo dejaría ejecutando una mezcla de instrucciones viejas y nuevas. Por eso la exclusión final la impone el **estado de la Debug Unit**, que rechaza con un error explícito lo que no corresponde (matriz definida en la arquitectura, §7.3):
+
+| Acción de la Debug Unit | EMPTY | READY | RUNNING | PAUSED | DONE |
+| --- | --- | --- | --- | --- | --- |
+| Escribir programa (`LOAD_PROGRAM`) | Permitido | Permitido | `ERR_BUSY` | Permitido | Permitido |
+| Leer memoria de datos (`GET_MEMORY`) | Permitido | Permitido | `ERR_BUSY` | Permitido | Permitido |
+| Leer registros y latches (`GET_REGS`, `GET_PIPELINE`) | Permitido | Permitido | `ERR_BUSY` | Permitido | Permitido |
+| Leer estado básico (`GET_STATUS`) | Permitido | Permitido | Permitido | Permitido | Permitido |
+
+Así, cualquier conflicto posible tiene una respuesta determinista: o el acceso se permite y es inofensivo, o se rechaza con `ERR_BUSY`.
+
+### Pruebas
+
+Las pruebas usan un mini sistema formado por `cpu_core` + `program_memory` + `data_memory`. La Debug Unit todavía no existe (llega en la épica E5), por lo que el testbench **emula sus acciones** usando exactamente los mismos puertos que usará ella: escribe el programa por el puerto de escritura de la memoria de programa y lee registros y memoria por los puertos de debug.
+
+Los programas de prueba se escriben con un mini-ensamblador (`asm_addi`, `asm_lw`, `asm_sw`, …) para que sean legibles. Sus codificaciones se cotejaron con un desensamblador externo. Hasta que exista `HALT` (US-4.3), cada programa termina en un salto a sí mismo (`jal x0, 0`), de modo que el CPU no ejecute posiciones sin programa.
+
+#### Pruebas con el CPU completo (`tb_structural_hazards`)
+
+| ID | Qué se prueba | Cómo | Resultado esperado |
+| --- | --- | --- | --- |
+| **T1** | Fetch y acceso a datos en el mismo ciclo | Programa que rellena 8 palabras y las copia a otra zona. Mezcla stores, loads, un load-use y saltos. Un monitor cuenta los ciclos en que MEM accede a datos y a la vez IF lee instrucciones | Datos copiados correctos; **24 de 24** accesos a datos coinciden con un fetch |
+| **T2** | WB escribe y ID lee el mismo registro | Consumidor a distancia 3 del productor, leyendo por el puerto A, por el B, y sobre `x0` | `x2 = 14`, `x7 = −9`, `x3 = 0`, `x0 = 0` |
+| **T3** | Store y load consecutivos sobre la misma palabra | Dos stores (`sw`, `sb`) y tres `lw` pegados, todos sobre una misma dirección | Cada `lw` ve el valor correcto según el orden del programa |
+| **T4** | Consultas de debug durante la ejecución | El mismo programa se ejecuta dos veces: sin actividad de debug y con la Debug Unit leyendo en cada ciclo la **misma palabra** que el CPU escribe (el caso más exigente) | Misma traza de PC, mismos 32 registros, misma memoria de datos |
+| **T5** | Escritura del programa con el CPU pausado | Se pausa el CPU en medio de la ejecución, se pisa la instrucción que está en vuelo y se reescriben las dos siguientes, y luego se reanuda | La instrucción en vuelo se ejecuta intacta, la pisada nunca se ejecuta, las reescritas se leen con su valor nuevo |
+
+#### Pruebas de las memorias (`tb_memory_port_contention`)
+
+Verifican directamente qué pasa cuando dos puertos chocan en el mismo ciclo.
+
+| ID | Situación | Resultado esperado |
+| --- | --- | --- |
+| **M1** | `program_memory`: el CPU lee y la Debug Unit escribe la misma dirección | La lectura devuelve el dato viejo; la siguiente, el nuevo |
+| **M2** | `program_memory`: se escribe con la lectura deshabilitada | La salida registrada no cambia |
+| **M3** | `program_memory`: lectura y escritura de direcciones distintas | Ambas correctas e independientes |
+| **M4** | `data_memory`: el puerto A lee y escribe la misma palabra | Dato viejo en ese ciclo, dato nuevo en el siguiente |
+| **M5** | `data_memory`: el puerto B lee la palabra que el A escribe | Dato viejo en ese ciclo, dato nuevo en el siguiente |
+| **M6** | `data_memory`: el puerto B recorre posiciones | La salida del puerto A no se altera |
+| **M7** | `data_memory`: store de un byte con el puerto B leyendo la misma palabra | Solo cambia el byte indicado |
+
+#### Resultado
+
+| Testbench | Verificaciones | Resultado |
+| --- | --- | --- |
+| `tb_structural_hazards` | 39 | Todas correctas |
+| `tb_memory_port_contention` | 15 | Todas correctas |
+
+Cada verificación imprime el valor observado y el esperado, por lo que el log de la simulación sirve como evidencia.
+
+#### ¿Las pruebas detectan fallas de verdad?
+
+Que una prueba pase no demuestra que sea capaz de fallar. Para comprobarlo, se inyectó una falla estructural a la vez en una copia del RTL y se verificó que alguna prueba la detecte:
+
+| Falla inyectada | Qué simula | Detectada por |
+| --- | --- | --- |
+| Sin bypass en el banco de registros | Conflicto WB/ID | T1, T2, T3 |
+| IF y MEM comparten memoria, MEM tiene prioridad | Memoria unificada sin arbitraje | T1, T3, T4 |
+| La memoria de programa lee aunque el CPU esté pausado | Lectura sin habilitación | T1, T4, T5 |
+| La Debug Unit le gana al CPU cuando tocan la misma palabra | RAM de un solo puerto | T1, T4 |
+| El puerto B pisa la salida del puerto A | Registro de salida compartido | M6 |
+
+> **Qué se aprendió en esta verificación.** La primera versión de T4 no detectaba la falla de la RAM de un solo puerto. La causa: la memoria de datos **no se borra** entre ejecuciones (decisión de diseño del proyecto), así que la segunda ejecución dejaba los mismos valores que la primera aunque sus stores se hubieran perdido. Se corrigió poniendo en cero la zona de memoria comparada antes de cada ejecución. Las pruebas que comparan contenido de `data_memory` deben tener en cuenta esta política.
+
+### Archivos y ejecución
+
+| Archivo | Contenido |
+| --- | --- |
+| `tb_structural_hazards.v` | Pruebas T1–T5 con el CPU completo y la Debug Unit emulada |
+| `tb_memory_port_contention.v` | Pruebas M1–M7 sobre las memorias |
+| `test_instruction_encoders.vh` | Mini-ensamblador para armar programas de prueba |
+| `test_check_helpers.vh` | Verificaciones y resumen compartidos por ambos testbenches |
