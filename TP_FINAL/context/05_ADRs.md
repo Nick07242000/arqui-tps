@@ -535,3 +535,62 @@ Tras un flush, `IF/ID` queda con `valid = 0` pero con la `instr` anulada (sale d
 - `GET_PIPELINE` puede traer campos no nulos en etapas con `valid = 0`. La CLI no debe desensamblar ni mostrar esos campos.
 - El ADR de burbujas en `ID/EX` sigue vigente para la burbuja insertada por stall o flush, pero no garantiza que la etapa se vea en ceros ciclos después.
 - Hay que ajustar la redacción del documento de arquitectura (§3) y fijar la regla en la especificación de la CLI (E6).
+
+## ADR - Exclusión entre Debug Unit y CPU por estado, sin interlock en hardware
+
+### Contexto
+
+La Debug Unit escribe la memoria de programa y lee registros y memoria de datos mientras el CPU puede estar corriendo. Hay que decidir quién evita que esos accesos interfieran: un circuito entre ambos o la máquina de estados de la Debug Unit.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Un interlock en hardware que bloquee la escritura de `program_memory` mientras el CPU avanza. |
+| **A** | **Sin interlock: la Debug Unit solo escribe en los estados permitidos y rechaza el resto con `ERR_BUSY`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Las lecturas de debug no necesitan protección: usan puertos de solo lectura con registro de salida propio, y no alteran el CPU aun si coinciden con un acceso del CPU.
+- La escritura de la memoria de programa con el CPU pausado tampoco corrompe nada: la lectura de instrucciones queda deshabilitada y la instrucción ya registrada en IF/ID no cambia.
+- El único riesgo real es lógico, no físico: escribir el programa mientras el CPU corre lo dejaría ejecutando una mezcla de instrucciones viejas y nuevas. Eso ya lo impide la matriz comando × estado (`LOAD_PROGRAM` devuelve `ERR_BUSY` en `RUNNING`).
+- Un interlock agregaría lógica y un camino hacia el habilitador de escritura de la memoria para cubrir algo que el protocolo ya cubre.
+
+### Consecuencias
+
+- El hardware, por sí solo, no impide una escritura de la Debug Unit durante `RUNNING`; depende de que la Debug Unit respete su matriz de estados.
+- En E5 hay que probar explícitamente que `LOAD_PROGRAM`, `GET_MEMORY`, `GET_REGS` y `GET_PIPELINE` devuelven `ERR_BUSY` en `RUNNING` (T5.3.7).
+- Si por error coinciden en el mismo ciclo y la misma dirección una lectura del CPU y una escritura de la Debug Unit, el resultado sigue siendo determinista: la lectura devuelve el dato anterior (verificado en `tb_memory_port_contention`).
+
+## ADR - Convenciones de los testbenches de riesgos estructurales
+
+### Contexto
+
+Los testbenches de la US-3.4 necesitan un CPU que ejecute programas, pero todavía no existen la Debug Unit (E5), `HALT` ni el límite `N_WORDS` (US-4.3). También hay que comparar el contenido de la memoria de datos, que el reset no borra por decisión de diseño.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Esperar a tener la Debug Unit y `HALT` para escribir estas pruebas. |
+| **A** | **Emular la Debug Unit desde el testbench, terminar los programas en `jal x0, 0` y limpiar la memoria de datos por jerarquía antes de las comparaciones.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- La emulación usa los mismos puertos que usará la Debug Unit (escritura de `program_memory`, puerto B de `data_memory` y puerto de debug de los registros), así que las pruebas siguen siendo válidas cuando exista la real.
+- Un salto a sí mismo mantiene al CPU sin ejecutar posiciones sin programa y no modifica registros ni memoria.
+- La memoria de datos conserva su contenido entre ejecuciones. Una prueba que compare contenido sin limpiarla puede pasar aunque se hayan perdido stores, porque la ejecución anterior dejó los mismos valores. Esto se detectó al inyectar fallas en el RTL (ver el documento de la US-3.4).
+
+### Consecuencias
+
+- La limpieza por jerarquía (`data_mem.byte_bank[n].bank[...]`) es un atajo solo de simulación y depende del nombre del bloque `generate` de `data_memory`. Si se renombra, hay que actualizar la tarea `clear_data_memory_words`.
+- Al implementar la US-4.3, los programas de prueba pueden pasar a terminar en `HALT` y la convención del salto a sí mismo se retira.
+- Los programas de prueba se arman con el mini-ensamblador `test_instruction_encoders.vh`, cotejado con un desensamblador externo, y no con hexadecimal escrito a mano.
