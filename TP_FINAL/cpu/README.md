@@ -1671,3 +1671,7 @@ Que una prueba pase no demuestra que sea capaz de fallar. Para comprobarlo, se i
 | `test_check_helpers.vh` | Verificaciones y resumen compartidos por ambos testbenches |
 
 ## Milestone Two - Status
+
+<img width="2720" height="2672" alt="cpu_pipeline_module_map" src="https://github.com/user-attachments/assets/d3b1b796-8125-4d21-a80b-5297f052f4b8" />
+
+<img width="2720" height="2480" alt="cpu_control_signals_overview" src="https://github.com/user-attachments/assets/ff32d707-1231-43ce-afe9-67e7660ce849" />
