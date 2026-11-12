@@ -907,7 +907,7 @@ La idea es la de una línea de montaje: mientras una instrucción se ejecuta en 
 - Todo el avance del pipeline controlado por una señal de habilitación (`i_cpu_en`), sin tocar el reloj.
 - Un testbench que registra, ciclo a ciclo, qué instrucción ocupa cada etapa y comprueba que cada escritura ocurre una sola vez.
 
-Por ahora **no se resuelven riesgos** de datos ni de control.
+Esta sección describe el pipeline base. Los riesgos de datos se resuelven en «Riesgos de Datos y Forwarding» y los de control en «Riesgos de control».
 
 ### Vista general
 
@@ -953,13 +953,13 @@ Cada latch captura sus entradas en el flanco de reloj en que el CPU avanza (`i_c
 | `valid`, `pc`, `instruction` | 1 / 32 / 32 | Identifican la instrucción. | validez en todo el pipeline; el resto es depuración |
 | `rs1_value`, `rs2_value` | 32 | Valores leídos del banco de registros. | EX (`rs2_value` también viaja como dato de store) |
 | `immediate` | 32 | Inmediato ya extendido. | EX |
-| `rs1_addr`, `rs2_addr`, `rd_addr` | 5 | Índices de registros. | `rd_addr` en WB; `rs1_addr`/`rs2_addr` en US-3.2 (forwarding) |
+| `rs1_addr`, `rs2_addr`, `rd_addr` | 5 | Índices de registros. | `rd_addr` en WB, forwarding y detección de load-use; `rs1_addr`/`rs2_addr` en el forwarding (EX) |
 | `alu_op` | 4 | Operación de la ALU. | EX |
 | `alu_src_b_is_imm` | 1 | Segundo operando: 0 = `rs2`, 1 = inmediato. | EX |
 | `reg_write`, `mem_read`, `mem_write` | 1 | Qué efecto tiene la instrucción. | MEM y WB |
 | `funct3` | 3 | Tamaño y signo de loads/stores. | MEM y WB |
 | `is_jal`, `is_jalr` | 1 | Saltos con dirección de retorno. | EX (resultado = `PC + 4`) |
-| `is_branch` | 1 | `beq` / `bne`. | US-3.3 |
+| `is_branch` | 1 | `beq` / `bne`. | EX (`branch-unit`) |
 | `is_halt`, `is_illegal` | 1 | Parada e instrucción no soportada. | E4 |
 
 #### EX/MEM
@@ -1037,12 +1037,12 @@ Las memorias quedan fuera del módulo, para que la Debug Unit pueda acceder a el
 
 El parámetro `MEM_ADDR_WIDTH` (por defecto 10) fija la profundidad de ambas memorias.
 
-### Alcance de esta versión
+### Funcionalidad pendiente
+
+Los riesgos de datos y de control ya están resueltos (US-3.2 y US-3.3).
 
 | Situación | Qué ocurre hoy | Se resuelve en |
 | --- | --- | --- |
-| Una instrucción usa un resultado producido menos de 3 instrucciones antes | Lee el valor viejo del registro | US-3.2 (forwarding y stall) |
-| `beq`, `bne`, `jal`, `jalr` | No modifican el PC; `jal`/`jalr` sí escriben `PC + 4` en `rd` | US-3.3 |
 | `HALT` y fin de la imagen | Se decodifica, pero el PC sigue avanzando | US-4.3 |
 | Debug Unit | `i_cpu_en` e `i_cpu_reset` los maneja el testbench | E5 |
 
@@ -1082,10 +1082,12 @@ Fragmento de la traza (cada columna indica el índice de la instrucción que ocu
 | Cuatro módulos de latch (uno por frontera) en lugar de un único `pipeline_registers` | Cada latch tiene una interfaz corta y propia, fácil de leer y de ampliar | La arquitectura los lista como un solo módulo; se materializa en cuatro |
 | Señales de control con nombre en los latches, no la palabra `ctrl` de 16 bits | Se entiende qué hace cada cable sin decodificar posiciones de bits | El empaquetado del formato de `GET_PIPELINE` se hace en E5, al armar `dbg_pipe` |
 | Bit `access_out_of_range` en MEM/WB | El rango se verifica en MEM, pero el load devuelve 0 recién en WB | Usa el bit 6, hoy reservado, de `ctrl8` |
-| Reset de todos los campos de los latches, no solo de `valid` | Las consultas de depuración tras un reset muestran ceros, no restos de la ejecución anterior | Costo despreciable: el reset síncrono es propio de los flip-flops de la FPGA |
+| Reset de todos los campos de los latches, no solo de `valid` | Las consultas de depuración tras un reset muestran ceros en los latches, no restos de la ejecución anterior. Excepción: `IF/ID.instr` y `MEM/WB.mem_raw` salen de las memorias y conservan su último valor; el cliente decide por `valid` | Costo despreciable: el reset síncrono es propio de los flip-flops de la FPGA |
 | `cpu_core` ya expone `i_debug_reg_addr` / `o_debug_reg_data` | Reutiliza el puerto de debug del banco de registros y deja lista la consulta de `GET_REGS` | Ninguna |
 
-Algunas salidas quedan sin conectar a propósito hasta que exista su consumidor: `o_uses_rs1`/`o_uses_rs2` del decodificador (US-3.2) y `o_is_misaligned` del chequeo de accesos (E5). La síntesis elimina los campos `pc` e `instruction` de los latches mientras nadie los lea; reaparecerán al conectar el snapshot de depuración, y conviene medir recursos y timing recién después.
+Algunas salidas quedan sin conectar a propósito hasta que exista su consumidor: `o_is_misaligned` del chequeo de accesos (E5) y `is_halt`/`is_illegal` de `ID/EX` (US-4.3).
+
+La síntesis elimina los campos `pc` e `instruction` de los latches mientras nadie los lea; reaparecerán al conectar el snapshot de depuración, y conviene medir recursos y timing recién después.
 
 ## Riesgos de Datos y Forwarding
 
@@ -1667,3 +1669,5 @@ Que una prueba pase no demuestra que sea capaz de fallar. Para comprobarlo, se i
 | `tb_memory_port_contention.v` | Pruebas M1–M7 sobre las memorias |
 | `test_instruction_encoders.vh` | Mini-ensamblador para armar programas de prueba |
 | `test_check_helpers.vh` | Verificaciones y resumen compartidos por ambos testbenches |
+
+## Milestone Two - Status

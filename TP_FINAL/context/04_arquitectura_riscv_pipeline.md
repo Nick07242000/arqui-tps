@@ -65,16 +65,16 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
     ├── control_unit         # decode de opcode/funct3/funct7 (+ ilegal, HALT)
     ├── data_access_checker  # rango y alineacion de loads/stores en MEM
     ├── immediate_generator
-    ├── register_file        # 32x32, 2R+1W, bypass WB->ID, puerto debug
+    ├── registers            # 32x32, 2R+1W, bypass WB->ID, puerto debug
     ├── forwarding_unit
     ├── hazard_unit          # stall load-use y flush
     ├── alu
     ├── branch_unit          # condicion y destino de branch/jal/jalr en EX
     ├── halt_controller      # halting, done, done_reason
-    ├── if_id_register       # latch IF/ID (valid, pc)
-    ├── id_ex_register       # latch ID/EX
-    ├── ex_mem_register      # latch EX/MEM
-    ├── mem_wb_register      # latch MEM/WB
+    ├── register_if_id       # latch IF/ID (valid, pc)
+    ├── register_id_ex       # latch ID/EX
+    ├── register_ex_mem      # latch EX/MEM
+    ├── register_mem_wb      # latch MEM/WB
     └── perf_counters        # cycles, retired
 ```
 
@@ -117,7 +117,7 @@ flowchart LR
   subgraph S_ID["ID"]
     CU["control_unit"]
     IG["immediate_generator"]
-    RF["register_file<br/>x0 = 0, bypass WB"]
+    RF["registers<br/>x0 = 0, bypass WB"]
   end
 
   L_IFID --> CU
@@ -245,7 +245,9 @@ En `EX/MEM`, `[7:6]` = 0. En `MEM/WB`, `[6]` = `access_out_of_range` (el acceso 
 
 ### 3.2 Contenido de cada latch (también es el formato de `GET_PIPELINE`)
 
-Todos los campos de 32 bits en little-endian. Cada latch también transporta `pc` e `instr` **solo para depuración/visualización** (costo: 4×64 FF, aceptable).
+Todos los campos de 32 bits en little-endian. `ID/EX`, `EX/MEM` y` MEM/WB` también transportan `pc` e `instr` **solo para depuración/visualización**.
+
+`IF/ID` guarda únicamente `pc`: su `instr` es la salida registrada de la BRAM de `imem` y se toma de `imem_read_data` al armar `dbg_pipe` (costo: 3×64 + 32 = 224 FF; la síntesis los elimina mientras nadie los lea).
 
 | Latch | Offset | Tamaño | Campo |
 | --- | --- | --- | --- |
@@ -409,9 +411,7 @@ stall = ifid.valid && idex.valid && idex.mem_read && idex.rd != 0 &&
         ((uses_rs1 && ifid_rs1 == idex.rd) || (uses_rs2 && ifid_rs2 == idex.rd));
 ```
 
-**ifid.valid**: hoy el procesador puede frenarse por una instrucción que en realidad ya no existe, porque IF/ID marca “no válido” pero conserva la palabra vieja. Pasa, por ejemplo, si un lw es lo último de un programa sin HALT: la palabra que sigue es un resto de un programa anterior. Esa palabra puede coincidir con el registro del load y causar un ciclo de más, de modo que cycles dependería de basura de memoria. Con ifid.valid solo se frena por instrucciones reales.
-
-> El fix de ifid.valid es cosmético, no un bug. Dije que los ciclos podían depender de basura en imem. Lo medí y no es cierto: sin el fix la señal stall se activa una vez de más, pero los ciclos son idénticos (caso dirigido y 6000 programas). Cuando IF/ID es inválido el frente ya está vacío y el bubble en ID/EX se inserta igual. Es inocuo y puede quedar, pero no lo cuentes como corrección funcional.
+**ifid.valid** (guarda defensiva): con `IF/ID.valid = 0` el frente ya está vacío y `ID/EX` recibe una burbuja de todos modos, por lo que un stall en ese caso no cambia ciclos ni efectos. La guarda evita questall dependa del contenido residual de la memoria de programa. No corrige ningún comportamiento observable: quitarla no modifica el estado final ni los ciclos (verificado por inyección de falla en 600 casos aleatorios).
 
 Efecto del stall (todo lo demás sigue avanzando):
 
@@ -606,6 +606,8 @@ stateDiagram-v2
 **`STEP`:** la DU emite `step_pulse` (1 ciclo), espera 1 ciclo, muestrea `done` y recién entonces responde (con el estado resultante). Las consultas posteriores devuelven la instantánea post-ciclo.
 
 **Consultas de solo lectura:** `GET_*` nunca activan `cpu_en`, no escriben memoria ni registros, y no alteran ningún latch (la lectura de `dmem` usa el puerto B).
+
+Los registros devueltos con la CPU en `PAUSED` reflejan el estado previo al WB de la instrucción visible en `MEM/WB`: esa escritura se aplica en el flanco del siguiente `STEP`.
 
 ---
 
@@ -830,7 +832,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | `cpu_done_reason` | `cpu_core` → `debug_unit` | 2 | 1 = HALT, 2 = END_OF_IMAGE |
 | `cpu_halting` | `cpu_core` → `debug_unit` | 1 | HALT confirmado |
 | `cpu_pc` | `cpu_core` → `debug_unit` | 32 | PC actual |
-| `flag_illegal`, `flag_dmem_oob`, `flag_misaligned` | `cpu_core` → `debug_unit` | 1+1 | Flags sticky |
+| `flag_illegal`, `flag_dmem_oob`, `flag_misaligned` | `cpu_core` → `debug_unit` | 1+1+1 | Flags sticky |
 | `cycles`, `retired` | `cpu_core` → `debug_unit` | 32+32 | Contadores |
 | `dbg_reg_idx` | `debug_unit` → `cpu_core` | 5 | Registro a leer |
 | `dbg_reg_data` | `cpu_core` → `debug_unit` | 32 | Valor (lectura combinacional) |
@@ -861,10 +863,10 @@ cycle 12   pc=0x00000014   state=PAUSED
 | `halt_commit` | EX → `halt_controller` | 1 | `HALT` válido en EX |
 | `front_end_flush` | `hazard_unit` → `IF/ID`, `ID/EX` | 1 | `redirect \|\| halt_commit` (hoy solo `redirect`; `halt_commit` se suma en US-4.3) |
 | `fwd_a`, `fwd_b` | `forwarding_unit` → EX | 2+2 | `00` ID/EX · `01` EX/MEM · `10` WB |
-| `wb_data` | WB → `register_file`, EX (forward) | 32 | Resultado final de la instrucción en WB |
-| `wb_we`, `wb_rd` | WB → `register_file` | 1, 5 | `memwb.valid && reg_write && rd≠0` |
-| `halting` | `halt_controller` → `pc_control` | 1 | Fetch detenido por HALT |
-| `fetch_ok` | `pc_control` | 1 | `pc[31:2] < n_words` |
+| `wb_data` | WB → `registers`, EX (forward) | 32 | Resultado final de la instrucción en WB |
+| `wb_we`, `wb_rd` | WB → `registers` | 1, 5 | `memwb.valid && reg_write && rd≠0` |
+| `halting` | `halt_controller` → `cpu_core` (enable del PC y `valid` de IF/ID) | 1 | Fetch detenido por HALT |
+| `fetch_ok` | `cpu_core` (lógica de fetch, ADR-25) | 1 | `pc[31:2] < n_words` |
 
 ---
 
@@ -890,7 +892,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-16 | `dmem` como 4 bancos de byte con puerto B de debug | Una memoria 32 bits con byte-enable | Inferencia portable, consultas sin alterar el CPU | Posible duplicación de BRAM |
 | ADR-17 | Contadores `cycles`/`retired` | Omitirlos | Muy baratos y útiles para analizar CPI y penalizaciones | +64 FF |
 | ADR-18 | GNU `as` + macro `halt`; script no agrega HALT solo | Ensamblador propio; HALT automático | Reutilizar herramientas; poder probar `END_OF_IMAGE` | Aviso si falta HALT |
-| ADR-19 | Un módulo de latch por frontera (`if_id_register`, `id_ex_register`, `ex_mem_register`, `mem_wb_register`) | Un único `pipeline_registers`; el `register` genérico por campo o con todo empaquetado | Interfaz corta y propia por latch, campos con nombre, ampliable en US-3.2/3.3 | Un `always` similar repetido en cuatro módulos |
+| ADR-19 | Un módulo de latch por frontera (`register_if_id`, `register_id_ex`, `register_ex_mem`, `register_mem_wb`) | Un único `pipeline_registers`; el `register` genérico por campo o con todo empaquetado | Interfaz corta y propia por latch, campos con nombre, ampliable en US-3.2/3.3 | Un `always` similar repetido en cuatro módulos |
 | ADR-20 | Controles como señales con nombre en el RTL; `ctrl`/`ctrl8` solo son el formato de `GET_PIPELINE` | Palabra `ctrl` empaquetada en los latches | Legibilidad: se evita decodificar posiciones de bits en cada etapa | El empaquetado se hace en E5 al armar `dbg_pipe` |
 | ADR-21 | Bit `access_out_of_range` en `MEM/WB` | Recalcular el rango en WB; no zerar el load fuera de rango | El rango se verifica en MEM pero el load se resuelve en WB | Usa el bit 6 reservado de `ctrl8` de `MEM/WB` |
 | ADR-22 | Burbuja en `ID/EX` con `i_insert_bubble`, que limpia el latch completo | Solo `enable`; limpiar solo `valid` y controles | Un `enable` no alcanza: el load debe avanzar a `EX/MEM` mientras `ID/EX` recibe un vacío | `register_id_ex` tiene una entrada más, reutilizable para el flush de la US-3.3 |
@@ -926,10 +928,10 @@ cycle 12   pc=0x00000014   state=PAUSED
 
 | Requisito | Módulos responsables |
 | --- | --- |
-| Pipeline de 5 etapas con latches | `if_id_register`, `id_ex_register`, `ex_mem_register`, `mem_wb_register`, `cpu_core` |
-| ISA enumerada | `control_unit`, `immediate_generator`, `alu`, `register_file`, `data_memory` |
+| Pipeline de 5 etapas con latches | `register_if_id`, `register_id_ex`, `register_ex_mem`, `register_mem_wb`, `cpu_core` |
+| ISA enumerada | `control_unit`, `immediate_generator`, `alu`, `registers`, `data_memory` |
 | Riesgos de datos/control/estructurales | `hazard_unit`, `forwarding_unit`, `branch_unit`, memorias separadas |
-| 32 registros, latches y memoria de datos por UART | `debug_unit`, `register_file` (puerto debug), `dbg_pipe`, `data_memory` (puerto B) |
+| 32 registros, latches y memoria de datos por UART | `debug_unit`, `registers` (puerto debug), `dbg_pipe`, `data_memory` (puerto B) |
 | Programación dinámica por UART | `debug_unit`, `program_memory` (puerto de escritura) |
 | HALT y vaciado | `halt_controller`, `control_unit` |
 | Paso a paso sin intervenir el clock | `debug_unit` (`cpu_en`), CE en todo el CPU |

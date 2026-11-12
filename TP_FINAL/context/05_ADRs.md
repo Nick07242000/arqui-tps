@@ -105,7 +105,7 @@ Cuando el procesador detecta un acceso a memoria de datos fuera del rango de dir
 
 ### Consecuencias
 
-* Utiliza el bit 6 (actualmente reservado) del campo `ctrl8` definido en el documento de arquitectura `04` §3.1. Se debe actualizar ese documento.
+* Utiliza el bit 6 (antes reservado) del campo `ctrl8` de `MEM/WB`, ya reflejado en el documento de arquitectura 04 §3.1.
 
 ## ADR - Alcance del reset en los latches del pipeline
 
@@ -126,7 +126,7 @@ Al aplicar una señal de reset al procesador, se debe definir qué porción del 
 
 ### Motivos
 
-* Las consultas de depuración realizadas inmediatamente tras un reset muestran un estado completamente en ceros, evitando que el usuario de debug vea basura o restos confusos de la ejecución anterior.
+* Las consultas de depuración realizadas inmediatamente tras un reset muestran todos los latches en ceros, sin restos de la ejecución anterior. Excepción: `IF/ID.instr` y `MEM/WB.mem_raw` son salidas de las memorias, no de los latches, y conservan su último valor; el cliente decide por `valid` (ver ADR «Contenido de una etapa invalidada»).
 
 ### Consecuencias
 
@@ -207,58 +207,6 @@ Cuando se detecta un riesgo de datos insalvable (por ejemplo, un *Load-Use hazar
 
 * Se evitan problemas de sincronismo, *glitches* y violaciones de timing que suelen ocurrir al manipular el reloj en FPGAs.
 
-## ADR - Lógica de comparación en el Forwarding
-
-### Contexto
-
-La unidad de adelantamiento debe comparar las direcciones de los registros destino de las etapas avanzadas con las direcciones de los registros fuente de la etapa de ejecución para inyectar los datos más recientes.
-
-### Alternativas
-
-| Opción | Descripción |
-| --- | --- |
-| 0 | Hacer viajar las banderas `uses_rs1` y `uses_rs2` por los latches para validar que la instrucción destino realmente lee ese registro. |
-| **A** | **El forwarding compara solo los números de registro, ignorando la señal `uses_rs`.** |
-
-### Decisión
-
-**Opción A.**
-
-### Motivos
-
-* Si el campo comparado no es realmente una fuente para la instrucción actual, el multiplexor adelantará un valor que simplemente será ignorado por el datapath.
-* A diferencia del forwarding, la lógica de stall sí requiere comprobar `uses_rs` para evitar frenar el pipeline innecesariamente.
-
-### Consecuencias
-
-* Se reduce el tamaño de los latches intermedios y se simplifica la lógica combinacional del módulo de forwarding.
-
-## ADR - Limpieza del latch al insertar una burbuja
-
-### Contexto
-
-Cuando es necesario anular una instrucción en el cauce (por ejemplo, al insertar un stall o vaciar el pipeline por un salto), se debe introducir una "burbuja" en el registro intermedio (ej. `ID/EX`).
-
-### Alternativas
-
-| Opción | Descripción |
-| --- | --- |
-| 0 | Limpiar únicamente el bit `valid` y poner en cero las señales de control de memoria y escritura. |
-| **A** | **La burbuja limpia todos los campos del latch `ID/EX` por completo.** |
-
-### Decisión
-
-**Opción A.**
-
-### Motivos
-
-* Coincide con la política definida para el reset de los latches.
-* Una burbuja se visualiza en las herramientas de depuración (debug) como una etapa completamente vacía y en ceros, facilitando su interpretación.
-
-### Consecuencias
-
-* Consume levemente más lógica de ruteo para poner a cero los datos de los registros de propósito general y los inmediatos, pero mejora sustancialmente la experiencia de depuración.
-
 ## ADR - Ubicación de la sección de riesgos en el Top-Level
 
 ### Contexto
@@ -304,12 +252,12 @@ Durante ciclos irregulares (como el arranque) o frente a combinaciones particula
 ### Motivos
 
 * La condición de evitar el forwarding si la instrucción fuente es una lectura a memoria (`!mem_read`) cumple explícitamente con la tarea T3.2.3 de la especificación.
-* La guarda `if_id_valid` evita generar un stall espurio cuando el latch `IF/ID` contiene basura (por ejemplo, ceros o restos de memoria) al estar inactivo.
-* Ninguna de estas condiciones altera el comportamiento observable del procesador en su ejecución normal.
+* La guarda `if_id_valid` evita que `stall` dependa del contenido residual de `IF/ID` cuando la etapa está vacía. No cambia ciclos ni efectos: con `IF/ID` inválido el frente ya está vacío.
+* Ninguna de las dos guardas altera el comportamiento observable. Verificado por inyección de falla: al quitar cualquiera, el estado final y los ciclos no cambian en 600 casos aleatorios. La guarda `!mem_read` es inalcanzable porque el stall load-use ya impide ese caso.
 
 ### Consecuencias
 
-* Prevención de interbloqueos (deadlocks) en el arranque o comportamientos indefinidos transitorios.
+* Hacen explícita la regla T3.2.3 y evitan que la lógica de riesgos dependa del contenido de etapas vacías. No previenen interbloqueos: no existe ninguno posible, porque tras un stall `ID/EX` recibe siempre una burbuja.
 
 ## ADR - Inserción de burbujas en ID/EX
 
@@ -332,12 +280,14 @@ En un stall load-use, el `load` debe avanzar de EX a MEM mientras la instrucció
 ### Motivos
 
 - `i_enable` solo puede retener o capturar; una burbuja requiere capturar "nada".
-- Es consistente con el ADR del alcance del reset: una burbuja se ve en debug como una etapa vacía.
+- Es consistente con el ADR del alcance del reset: la burbuja insertada deja la etapa vacía (la visualización posterior la decide `valid`, ver ADR «Contenido de una etapa invalidada»)
+- Coincide con la política definida para el reset de los latches.
 
 ### Consecuencias
 
 - La burbuja solo se inserta si el CPU avanza (`i_enable && i_insert_bubble`).
 - La US-3.3 reutiliza la misma entrada para el flush.
+- La señal de limpieza (stall o flush) llega a unos 190 FF de ID/EX. Si en E7 limita el timing, alcanza con limpiar valid y los controles de efecto.
 
 ## ADR - Forwarding sin `uses_rs`
 
@@ -364,6 +314,7 @@ El forwarding compara `rs1`/`rs2` de la instrucción en EX contra el destino de 
 ### Consecuencias
 
 - `store_data` de instrucciones que no son stores puede mostrar un valor adelantado sin significado, sin efectos.
+- Se reduce el tamaño de los latches intermedios y se simplifica la lógica combinacional del módulo de forwarding.
 
 ## ADR - Módulo de resolución de saltos
 
@@ -419,7 +370,6 @@ El documento de arquitectura (§1.1) lista un módulo `pc_control`. Con la US-3.
 ### Consecuencias
 
 - `pc_control` no se materializa. Si la US-4.3 necesita más lógica de fetch (`fetch_stop`, límite `N_WORDS`), conviene reevaluar la extracción.
-- El documento de arquitectura (§1.1) debe actualizarse.
 
 ## ADR - Generación del flush en `hazard_unit`
 
