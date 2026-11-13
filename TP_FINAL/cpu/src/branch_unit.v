@@ -36,10 +36,11 @@ module branch_unit (
     // -------------------------------------------------------------------------
     // Destino del salto
     // -------------------------------------------------------------------------
-    wire [31:0] pc_relative_target = i_pc + i_immediate;               // branch y jal
-    wire [31:0] jalr_target        = {i_alu_result[31:1], 1'b0};       // la ISA anula el bit 0
+    wire [31:0] pc_relative_target = i_pc + i_immediate;         // branch y jal
+    wire [31:0] unaligned_target   = i_is_jalr ? i_alu_result : pc_relative_target;
 
-    assign o_redirect_pc = i_is_jalr ? jalr_target : pc_relative_target;
+    // Toda instruccion ocupa 4 bytes: el destino se alinea a palabra
+    assign o_redirect_pc = {unaligned_target[31:2], 2'b00};
 
     // -------------------------------------------------------------------------
     // Solo una instruccion valida puede cambiar el flujo

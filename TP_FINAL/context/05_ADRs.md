@@ -335,7 +335,7 @@ La etapa EX debe decidir si un `beq`, `bne`, `jal` o `jalr` cambia el flujo y ha
 
 ### Motivos
 
-- Se prueba por separado con casos límite (igualdad en un solo bit, destinos negativos, bit 0 de `jalr`) sin armar un programa completo.
+- Se prueba por separado con casos límite (igualdad en un solo bit, destinos negativos, bits bajos del destino de `jalr`) sin armar un programa completo.
 - `cpu_core` conserva su papel de cableado entre etapas.
 - La condición y el destino quedan juntos y fáciles de leer en pocas líneas.
 
@@ -432,14 +432,16 @@ El flush por salto tomado afecta a `IF/ID` e `ID/EX`, igual que el stall afecta 
 
 ### Contexto
 
-El destino de `jalr` es `rs1 + imm` con el bit 0 anulado. `branch` y `jal` usan `PC + imm`, que requiere un sumador dedicado.
+El destino de `jalr` es `rs1 + imm`; la ISA anula el bit 0 y, sin extensión C, este procesador alinea también el bit 1.
+
+`branch` y `jal` usan `PC + imm`, que requiere un sumador dedicado.
 
 ### Alternativas
 
 | Opción | Descripción |
 | --- | --- |
 | 0 | Un segundo sumador dentro de `branch_unit` para `rs1 + imm`. |
-| **A** | **Reutilizar el resultado de la ALU (`rs1 + imm`) y anular el bit 0 en `branch_unit`.** |
+| **A** | **Reutilizar el resultado de la ALU (`rs1 + imm`) y alinear a palabra el destino de todos los saltos en `branch_unit`.** |
 
 ### Decisión
 

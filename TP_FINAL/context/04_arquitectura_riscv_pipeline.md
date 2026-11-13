@@ -330,7 +330,7 @@ Shifts inmediatos: `shamt = imm[4:0]`; la ALU solo usa `B[4:0]` en SLL/SRL/SRA.
 **Resultados especiales en EX:**
 - `jal`/`jalr`: `result = PC + 4` (dirección de retorno).
 - `jal`/`branch` taken: `target = pc + imm` (sumador dedicado).
-- `jalr`: `target = (rs1_fwd + imm) & ~32'b1` (usa la ALU, regla de la ISA).
+- `jalr`: `target = (rs1_fwd + imm) & ~32'b11` (usa la ALU, alineacion de PC).
 - `beq`/`bne`: comparador de igualdad dedicado sobre operandos con forwarding: `taken = (rs1_fwd == rs2_fwd) ^ funct3[0]`.
 
 ---
@@ -374,7 +374,7 @@ Sin sumadores extra ni *shifters* en MEM:
 | --- | --- |
 | Acceso desalineado (`lh/sh` con `addr[0]=1`, `lw/sw` con `addr[1:0]≠0`) | **Fuera de contrato**: se alinea hacia abajo (ignora los bits bajos). Sin excepción, pero se levanta el flag sticky `misaligned_seen`. |
 | Dirección de datos `addr[31:12] ≠ 0` | Store **suprimido**, load devuelve 0, flag sticky `dmem_oob_seen`. El rango se verifica en MEM; el bit `access_out_of_range` viaja en `MEM/WB` para poner el load en 0 en WB |
-| PC con `pc[1:0] ≠ 0` (p. ej. por `jalr`) | Ignora los 2 bits bajos para indexar `imem` |
+| Destino de salto con `[1:0] ≠ 0` (p. ej. por `jalr`) | `branch_unit` lo alinea a palabra; el PC nunca queda desalineado |
 | Dirección de fetch ≥ `N_WORDS·4` | No se busca (ver §6.3) |
 
 ---
@@ -430,7 +430,8 @@ Efecto del stall (todo lo demás sigue avanzando):
 
 ```verilog
 redirect    = idex.valid && ((idex.branch && taken) || idex.jal || idex.jalr);
-redirect_pc = idex.jalr ? ({alu_result[31:1], 1'b0}) : (idex.pc + idex.imm);
+target = idex.jalr ? alu_result : (idex.pc + idex.imm);
+redirect_pc = {target[31:2], 2'b00};
 flush_front = redirect || halt_commit;     // ver §6.2
 ```
 
@@ -901,7 +902,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-25 | Próximo PC con `mux` en `cpu_core`, sin módulo `pc_control` | Módulo `pc_control` | Una sola señal de selección (`ex_redirect`); reutiliza `mux` | Reevaluar en US-4.3 si `fetch_stop` suma lógica |
 | ADR-26 | El flush se genera en `hazard_unit` (`i_ex_redirect` → `o_flush_front`) | `cpu_core` usa `ex_redirect` directo | Un solo lugar para stall y flush; US-4.3 suma `halt_commit` ahí | Hoy es una conexión directa |
 | ADR-27 | Flush de `IF/ID` con `i_insert_bubble` (misma semántica que `ID/EX`) | Entrada `i_flush` propia | Mismo nombre para el mismo comportamiento; no altera el pipeline con `cpu_en = 0` | `IF/ID.instr` no se limpia (sale de la BRAM) |
-| ADR-28 | Destino de `jalr` = resultado de la ALU con el bit 0 en 0 | Segundo sumador en `branch_unit` | Evita un sumador de 32 bits; respeta el forwarding | Camino `forwarding → ALU → redirect → PC` candidato a crítico (E7) |
+| ADR-28 | Destino de `jalr` = resultado de la ALU; todo destino de salto se alinea con `[1:0]` en 0 | Segundo sumador en `branch_unit` | Evita un sumador de 32 bits; respeta el forwarding | Camino `forwarding → ALU → redirect → PC` candidato a crítico (E7) |
 | ADR-29 | Una etapa con `valid = 0` está vacía: decide `valid`, no el contenido | Forzar ceros (burbuja si `!if_id_valid` y enmascarar `instr`) | Sin lógica extra solo para presentación; la interpretación es del cliente | `GET_PIPELINE` puede traer campos no nulos con `valid = 0` |
 
 ---

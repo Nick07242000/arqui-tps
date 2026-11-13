@@ -1430,10 +1430,11 @@ wire operands_are_equal = (i_rs1_value == i_rs2_value);
 wire branch_condition_is_met = (i_funct3 == `FUNCT3_BNE) ? !operands_are_equal
                                                          :  operands_are_equal;
 
-wire [31:0] pc_relative_target = i_pc + i_immediate;           // branch y jal
-wire [31:0] jalr_target        = {i_alu_result[31:1], 1'b0};   // la ISA anula el bit 0
+wire [31:0] pc_relative_target = i_pc + i_immediate;               // branch y jal
+wire [31:0] unaligned_target   = i_is_jalr ? i_alu_result : pc_relative_target;
 
-assign o_redirect_pc = i_is_jalr ? jalr_target : pc_relative_target;
+// Sin extension C toda instruccion ocupa 4 bytes: el destino se alinea a palabra
+assign o_redirect_pc = {unaligned_target[31:2], 2'b00};
 assign o_redirect    = i_valid && ((i_is_branch && branch_condition_is_met)
                                    || i_is_jal || i_is_jalr);
 ```
@@ -1483,7 +1484,7 @@ El PC sigue siendo una instancia de `register`; no se creó un módulo `pc_contr
 | Salto a la dirección que el fetch ya había pedido (`beq … , 8`) | La búsqueda errónea se anula y se repite: la instrucción se ejecuta **una sola vez**. |
 | Dos saltos tomados consecutivos | Funciona: cada uno paga sus 2 ciclos. |
 | Salto a sí mismo (`jal x0, 0`) | Lazo infinito válido. No ejecuta nada posterior. |
-| Destino no alineado a 4 bytes | Fuera de contrato (sin extensión C). La memoria de programa ignora los 2 bits bajos al indexar, como indica el documento de arquitectura. |
+| Destino no alineado a 4 bytes | Se alinea a palabra en `branch_unit` (`[1:0] = 00`); sin excepción, como los accesos a datos. |
 | Destino fuera de la imagen cargada | **Todavía no se controla.** Lo resuelve la US-4.3 con `N_WORDS`. |
 
 ### Verificación
@@ -1675,3 +1676,25 @@ Que una prueba pase no demuestra que sea capaz de fallar. Para comprobarlo, se i
 <img width="2720" height="2672" alt="cpu_pipeline_module_map" src="https://github.com/user-attachments/assets/d3b1b796-8125-4d21-a80b-5297f052f4b8" />
 
 <img width="2720" height="2480" alt="cpu_control_signals_overview" src="https://github.com/user-attachments/assets/ff32d707-1231-43ce-afe9-67e7660ce849" />
+
+| Etapa | Módulo | Rol / Función |
+| --- | --- | --- |
+| **IF** | `next_pc_mux` | Elige entre PC+4 o la dirección destino del salto (*branch target*) |
+| **IF** | `program_counter` | Almacena el contador de programa (PC) |
+| **IF** | `program_memory` | Memoria de instrucciones (fuera de `cpu_core`) |
+| **ID** | `registers` | Banco de registros: 2 lecturas y 1 escritura, con *bypass* de *write-back* |
+| **ID** | `control_unit` | Decodifica la instrucción en señales de control |
+| **ID** | `immediate_generator` | Construye el valor inmediato para cada formato |
+| **ID** | `hazard_unit` | Detención por riesgo *load-use* (*stall*) y vaciado del *front-end* (*flush*) |
+| **EX** | `forwarding_unit` | Elige la fuente de cada operando (adelantamiento) |
+| **EX** | `forward_rs1_mux`, `forward_rs2_mux` | Los dos multiplexores 3:1 de operandos (un solo bloque en el diagrama) |
+| **EX** | `alu_operand_b_mux` | Selecciona `rs2` o el valor inmediato |
+| **EX** | `alu` | Operaciones aritméticas, lógicas, desplazamientos y comparaciones |
+| **EX** | `ex_result_mux` | Selecciona el resultado de la ALU o PC+4 |
+| **EX** | `branch_unit` | Condición de salto, dirección destino y redirección |
+| **MEM** | `data_access_checker` | Verificación de rango y alineación de memoria |
+| **MEM** | `store_data_formatter` | Habilitación de bytes y datos para `sb`, `sh`, `sw` |
+| **MEM** | `data_memory` | Memoria de datos (fuera de `cpu_core`) |
+| **WB** | `load_data_extender` | Extracción de byte o media palabra (*halfword*) con extensión de signo o cero |
+| **WB** | `wb_data_mux` | Elige el valor cargado de memoria o el de la ALU, luego escribe de vuelta y adelanta |
+| **Entre etapas** | `register_if_id`, `register_id_ex`, `register_ex_mem`, `register_mem_wb` | Los cuatro registros de segmentación (*pipeline latches*) |
