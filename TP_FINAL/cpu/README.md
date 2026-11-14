@@ -1698,3 +1698,131 @@ Que una prueba pase no demuestra que sea capaz de fallar. Para comprobarlo, se i
 | **WB** | `load_data_extender` | Extracción de byte o media palabra (*halfword*) con extensión de signo o cero |
 | **WB** | `wb_data_mux` | Elige el valor cargado de memoria o el de la ALU, luego escribe de vuelta y adelanta |
 | **Entre etapas** | `register_if_id`, `register_id_ex`, `register_ex_mem`, `register_mem_wb` | Los cuatro registros de segmentación (*pipeline latches*) |
+
+## Política de reset y estado inicial
+
+### Qué resuelve
+
+Un procesador segmentado guarda mucho estado: el PC, 31 registros, cuatro latches de pipeline y dos memorias. Antes de ejecutar un programa hay que saber **exactamente en qué estado está cada una de esas partes**; de lo contrario, el resultado de una ejecución podría depender de lo que corrió antes.
+
+Esta historia define esa política y demuestra que se cumple. La regla central es simple:
+
+> **El reset devuelve al CPU a un estado conocido (PC, registros y pipeline) y no toca las memorias.**
+
+El RTL entregado en la épica E3 ya implementaba este comportamiento, por lo que **esta historia no modifica ningún módulo**. Su aporte es fijar la política por escrito, probarla con un testbench específico (`tb_cpu_reset_policy.v`) y comprobar que ese testbench realmente detecta fallas.
+
+### Tres operaciones distintas
+
+El diseño separa tres acciones que a veces se confunden. Cada una usa una señal propia, y ninguna hace el trabajo de otra.
+
+| Operación | Señal / interfaz | Qué cambia | Qué **no** cambia |
+| --- | --- | --- | --- |
+| **Reset del CPU** (`RESET`) | `i_cpu_reset` | PC, registros, latches del pipeline | Memoria de datos, memoria de programa |
+| **Carga de programa** (`LOAD_PROGRAM`) | Reset inicial + puerto de escritura de `program_memory`, con `i_cpu_en = 0` | Todo lo del reset, más el contenido de la memoria de programa | Memoria de datos |
+| **Inicio / pausa de ejecución** (`RUN`, `STEP`) | `i_cpu_en` | Hace avanzar el pipeline un ciclo | Nada se reinicia: pausar no es resetear |
+
+```mermaid
+sequenceDiagram
+  participant DU as Debug Unit
+  participant CPU as cpu_core
+  participant IM as program_memory
+  DU->>CPU: i_cpu_reset = 1 (al menos un flanco)
+  Note over CPU: PC, registros y pipeline en estado inicial
+  DU->>IM: escribe la imagen (i_cpu_en = 0)
+  Note over CPU: cargar NO inicia la ejecución
+  DU->>CPU: i_cpu_en = 1 (RUN)
+  Note over CPU: ejecuta desde PC = 0
+  DU->>CPU: i_cpu_en = 0 (pausa)
+  Note over CPU: estado congelado, nada se pierde
+  DU->>CPU: i_cpu_reset = 1 (RESET)
+  Note over CPU: aborta lo que estaba en vuelo
+```
+
+### Estado después de cada evento
+
+| Evento | PC | `x1`–`x31` | Pipeline | Memoria de datos | Memoria de programa |
+| --- | --- | --- | --- | --- | --- |
+| `RESET` | 0 | 0 | vacío | **se conserva** | **se conserva** |
+| `LOAD_PROGRAM` | 0 | 0 | vacío | **se conserva** | se sobrescribe con la nueva imagen |
+
+`x0` vale siempre 0 y descarta cualquier escritura.
+
+### Cómo lo implementa el hardware
+
+No existe un módulo "de reset". La política es el resultado de cómo se comporta cada bloque ante la señal `i_cpu_reset`.
+
+| Bloque | Efecto del reset |
+| --- | --- |
+| `program_counter` | El PC vuelve a 0. |
+| Latches `IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB` | Todos los campos vuelven a 0, incluido `valid`. |
+| `registers` | Los 32 registros vuelven a 0; `x0` se lee siempre como 0. |
+| Escritura de stores (`cpu_core`) | Se deshabilita mientras `i_cpu_reset = 1`. |
+| `data_memory` y `program_memory` | **No tienen reset.** Conservan su contenido por diseño. |
+
+**Reglas de prioridad.** Tres reglas hacen que el reset sea confiable en cualquier situación:
+
+1. **El reset gana sobre `i_cpu_en`.** Funciona aunque el CPU esté pausado.
+2. **El reset gana sobre stall, flush y redirect.** Si llega en el mismo ciclo que un salto, el PC queda en 0 y no en el destino del salto.
+3. **El reset aborta lo que está en vuelo.** Un store que estaba en MEM no se escribe, y una escritura de registro que estaba en WB no se aplica.
+
+**Qué no se limpia.** `IF/ID.instr` y `MEM/WB.mem_raw` salen directamente de las memorias, no de los latches, por lo que conservan su último valor después de un reset. No es un problema: una etapa con `valid = 0` está vacía y su contenido se ignora (ADR «Contenido de una etapa invalidada»).
+
+### Respuestas a las preguntas de la consigna
+
+| Pregunta | Respuesta | Por qué |
+| --- | --- | --- |
+| ¿Hay que vaciar la memoria al reprogramar? | **No** | Cada programa debe inicializar lo que lee. Evita un recorrido de limpieza. |
+| ¿Hay que limpiar el banco de registros? | **Sí** | Así cada ejecución es reproducible y no hereda valores de la anterior. Es gratis: ya existe el reset síncrono. |
+| ¿Hay que vaciar el pipeline? | **Sí** | Con todos los `valid` en 0 no puede sobrevivir una instrucción de la ejecución anterior. |
+| ¿Hay que vaciar la memoria de programa? | **No** | Las palabras viejas que sobran después de una imagen más corta se bloquean con `N_WORDS` (US-4.3). |
+
+> **Consecuencia a tener en cuenta:** como la memoria de datos persiste, un programa puede leer datos que dejó el anterior. Es intencional, pero obliga a que los programas de prueba inicialicen explícitamente las posiciones que usan.
+
+### Qué pasa si el reset llega en medio de una ejecución
+
+| Situación en el instante del reset | Resultado |
+| --- | --- |
+| CPU pausado, estado "sucio" de una ejecución previa | Todo vuelve al estado inicial. |
+| Un `store` está en MEM y otra instrucción en WB | Ninguna de las dos tiene efecto: la memoria queda intacta y el registro no se escribe. |
+| Stall por dependencia load-use en curso | Se limpia todo; el programa puede reiniciarse desde PC = 0. |
+| Un `jal` o branch tomado se resuelve en EX | El PC queda en 0, no en el destino del salto. |
+
+**Requisito para quien genere el reset:** debe mantenerse activo **al menos un flanco de reloj**. Como el reset es síncrono, un pulso que empiece y termine entre dos flancos no tiene ningún efecto. La Debug Unit (E5) debe respetar esto en `RESET` y al inicio de `LOAD_PROGRAM`.
+
+### Verificación
+
+El testbench `tb_cpu_reset_policy.v` emula la Debug Unit con los mismos puertos que usará la real (reset, puerto de escritura de programa y `cpu_en`) y lee los resultados por las interfaces de debug (registros y puerto B de `data_memory`).
+
+| # | Test | Qué demuestra |
+| --- | --- | --- |
+| 1 | Estado inicial tras el primer reset | PC = 0, 32 registros en 0, todos los latches en 0. |
+| 2 | `RESET` con el CPU pausado | Se limpia un estado "sucio" (`x1`–`x31` con valores conocidos). |
+| 3 | `RESET` durante `RUN` con un store en MEM y un WB en curso | Se aborta lo que estaba en vuelo; la memoria queda intacta. Un control positivo confirma que sin reset el mismo programa sí escribe. |
+| 4 | `RESET` durante un stall load-use | Se limpia todo y el programa se reinicia bien. |
+| 5 | `RESET` en el mismo ciclo que un redirect | El PC queda en 0; el camino incorrecto del salto nunca se ejecuta. |
+| 6 | Memoria de datos tras `RESET` y tras `LOAD` | Los datos sembrados siguen intactos. |
+| 7 | `LOAD` no inicia la ejecución; la pausa no es un reset | Tras cargar, el CPU espera en estado inicial; al pausar, el pipeline queda congelado y al reanudar continúa. |
+| 8 | Ejecuciones sucesivas A → B → B → A | B no hereda registros de A pero sí ve sus datos; repetir B con solo `RESET` (sin recargar) y volver a A da los mismos resultados. |
+
+- Se inyectaron **13 averías** en copias del RTL (un store que no se anula con el reset, registros que no se limpian, el reset perdiendo prioridad frente a `i_cpu_en`, un latch que no se invalida, memorias que se borran con el reset, entre otras). **Las 13 fueron detectadas**, cada una por el test previsto para ella.
+- Los programas de prueba se cotejaron palabra por palabra con un ensamblador RISC-V externo (GNU `as`, `rv32i`) y coinciden.
+
+> **Convención del testbench:** todas las tareas empiezan y terminan alineadas al flanco de bajada del reloj, y no se usan retardos `#n` sueltos. Durante el desarrollo, un retardo acumulado desfasó el testbench y un reset se aplicó "entre flancos", sin efecto. Los tests anteriores pasaban solo por casualidad de fase; la regla evita que vuelva a ocurrir.
+
+**Cómo ejecutarlo** (Icarus Verilog; RTL en `rtl/` y testbench en `tb/`, ajustar las rutas si el proyecto usa otra estructura):
+
+```bash
+iverilog -g2005 -I rtl -o tb_reset.vvp tb/tb_cpu_reset_policy.v rtl/*.v
+vvp tb_reset.vvp
+```
+
+La salida termina con `RESULTADO: PASS` o `RESULTADO: FAIL`.
+
+### Limitaciones y puntos pendientes
+
+| Tema | Estado |
+| --- | --- |
+| Contadores (`cycles`, `retired`) y flags sticky | Todavía no existen (E5). Cuando se implementen deben reiniciarse con `i_cpu_reset`, según la política de reset. |
+| Aislamiento entre imágenes de distinta longitud | Hoy los programas de prueba terminan en `jal x0, 0`. La protección real contra instrucciones residuales llega con `N_WORDS` y `HALT` (US-4.3). |
+| Secuencia de reset de la Debug Unit | Se define aquí como contrato y se prueba con una Debug Unit emulada. Su implementación es parte de E5. |
+| Reset de encendido (`sys_rst`) | Su sincronización con el botón externo se resuelve en la integración del top-level (E7). |
