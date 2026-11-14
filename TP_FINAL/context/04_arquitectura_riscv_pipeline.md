@@ -96,7 +96,7 @@ Los nombres siguen la tabla del roadmap (§2); `halt_controller` y `hazard_unit`
 - **Un solo dominio de reloj** (`clk`). Todo el diseño es síncrono por flanco de subida; las entradas asíncronas (`uart_rx_pin`, botón) pasan por sincronizador de 2 FF.
 - **Dos niveles de reset:**
   - `sys_rst`: power-on/botón. Reinicia *todo* (DU, UART, CPU, `n_words`, `prog_valid`). **No** garantiza limpieza de `imem`/`dmem`.
-  - `cpu_rst`: reset **síncrono** generado por la Debug Unit (comando `RESET` o fin de `LOAD_PROGRAM`). Reinicia solo el estado del CPU (§7.1). Tiene **prioridad sobre** `cpu_en`.
+  - `cpu_rst`: reset **síncrono** generado por la Debug Unit (comando `RESET`, o durante `LOAD_PROGRAM` desde que el encabezado es válido hasta el fin de la carga). Reinicia solo el estado del CPU (§7.1). Tiene **prioridad sobre** `cpu_en`.
 
 ---
 
@@ -487,7 +487,7 @@ Con `flush_front`: `IF/ID.valid ← 0` y la instrucción que estaba en ID **no e
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `sys_rst` (power-on/botón) | 0 | 0 | vacío | sin garantía | sin garantía | 0 (`prog_valid=0`) | 0 |
 | `RESET` (comando) | 0 | 0 | vacío | **se conserva** | **se conserva** | se conserva | 0 |
-| `LOAD_PROGRAM` | 0 (se aplica `cpu_rst`) | 0 | vacío | **se conserva** | se sobrescriben las primeras `N_WORDS` | = nuevo `N_WORDS` | 0 |
+| `LOAD_PROGRAM` (encabezado válido) | 0 (`cpu_rst` durante la carga) | 0 | vacío | **se conserva** | se sobrescriben las primeras `N_WORDS` | = nuevo `N_WORDS` | 0 |
 
 | Pregunta de la consigna | Respuesta |
 | --- | --- |
@@ -564,7 +564,7 @@ cpu_en = (state == RUNNING) | step_pulse        // step_pulse = 1 ciclo de clk
 
 | Código | Estado | Significado |
 | --- | --- | --- |
-| 0 | `EMPTY` | Sin programa válido (power-on o carga fallida) |
+| 0 | `EMPTY` | Sin programa válido (power-on o timeout tras validar encabezado en `LOAD_PROGRAM`) |
 | 1 | `READY` | Programa válido, CPU en estado de reset, sin ejecutar |
 | 2 | `RUNNING` | Ejecución continua en curso (**busy**) |
 | 3 | `PAUSED` | Se ejecutó ≥ 1 paso, no terminó |
@@ -575,7 +575,7 @@ cpu_en = (state == RUNNING) | step_pulse        // step_pulse = 1 ciclo de clk
 stateDiagram-v2
   [*] --> EMPTY: sys_rst
   EMPTY --> READY: LOAD ok
-  EMPTY --> EMPTY: LOAD error
+  EMPTY --> EMPTY: LOAD error / timeout
   READY --> RUNNING: RUN
   READY --> PAUSED: STEP
   PAUSED --> PAUSED: STEP sin done
@@ -586,14 +586,16 @@ stateDiagram-v2
   PAUSED --> READY: LOAD ok o RESET
   DONE --> READY: LOAD ok o RESET
   RUNNING --> READY: RESET abort
-  READY --> EMPTY: LOAD error
+  READY --> EMPTY: LOAD timeout post-encabezado
+  PAUSED --> EMPTY: LOAD timeout post-encabezado
+  DONE --> EMPTY: LOAD timeout post-encabezado
 ```
 
 ### 7.3 Matriz comando × estado
 
 | Comando | `EMPTY` | `READY` | `RUNNING` | `PAUSED` | `DONE` |
 | --- | --- | --- | --- | --- | --- |
-| `LOAD_PROGRAM` | OK → `READY` / error → `EMPTY` | idem | `ERR_BUSY` | idem | idem |
+| `LOAD_PROGRAM` | OK → `READY` / error o timeout → `EMPTY` | OK → `READY` / error encabezado o timeout previo → conserva estado / timeout post-encabezado → `EMPTY` | `ERR_BUSY` | igual que `READY` | igual que `READY` |
 | `RESET` | OK → `EMPTY`* | OK → `READY` | OK (**abort**) → `READY` | OK → `READY` | OK → `READY` |
 | `RUN` | `ERR_NO_PROGRAM` | OK → `RUNNING` | `ERR_BUSY` | OK → `RUNNING` | `ERR_STATE` |
 | `STEP` | `ERR_NO_PROGRAM` | OK (1 ciclo) | `ERR_BUSY` | OK (1 ciclo) | `ERR_STATE` |
@@ -706,11 +708,11 @@ Reglas:
 
 ### 8.4 `LOAD_PROGRAM` (mensaje único)
 
-1. Al recibir `CMD=0x01` en estado permitido: `prog_valid ← 0`, `n_words ← 0`, `cpu_rst`, estado `LOADING`.
-2. Se leen los 2 primeros bytes de payload (`N_WORDS`). Se valida `1 ≤ N_WORDS ≤ 1024` **y** `LEN == 2 + 4·N_WORDS`. Si falla: se consumen los bytes restantes sin escribir y se responde `ERR_ARG`/`ERR_LEN`.
-3. Si es válido, cada palabra completa (4 bytes LE) se escribe en `imem[i]` por el puerto de escritura de la DU.
-4. Al recibirse el último byte: `n_words ← N_WORDS`, `prog_valid ← 1`, estado `READY`, respuesta `OK`.
-5. Si el mensaje se trunca (100 ms sin bytes), `ERR_TIMEOUT` y el sistema queda en `EMPTY` (`prog_valid=0`): **nunca se acepta una carga incompleta**. `RUN` queda bloqueado.
+1. Al recibir `CMD=0x01` en estado permitido: pasa a estado `LOADING` para recibir el encabezado (`LEN` y `N_WORDS`) **sin** modificar `prog_valid`, `n_words`, CPU ni memorias (regla 3 de §8.3).
+2. Se leen los 2 primeros bytes de payload (`N_WORDS`). Se valida `1 ≤ N_WORDS ≤ 1024` **y** `LEN == 2 + 4·N_WORDS`. Si falla: se consumen los bytes restantes sin escribir, se responde `ERR_ARG`/`ERR_LEN` y **se regresa al estado previo sin tocar CPU ni memorias**. Si el encabezado es válido: `prog_valid ← 0`, `n_words ← 0` y se activa `cpu_rst`.
+3. Con `cpu_rst` sostenido, cada palabra completa (4 bytes LE) se escribe en `imem[i]` por el puerto de escritura de la DU.
+4. Al recibirse el último byte: se libera `cpu_rst` (`cpu_rst ← 0`), `n_words ← N_WORDS`, `prog_valid ← 1`, estado `READY`, respuesta `OK`.
+5. Si ocurre timeout (100 ms sin bytes) **antes** de validar el encabezado: se responde `ERR_TIMEOUT` conservando el estado previo. Si ocurre **con el encabezado ya válido**: se libera `cpu_rst`, se responde `ERR_TIMEOUT` y el sistema queda en `EMPTY` (`prog_valid=0`): **nunca se acepta una carga incompleta** y `RUN` queda bloqueado.
 
 ```mermaid
 sequenceDiagram
@@ -718,8 +720,10 @@ sequenceDiagram
   participant DU as Debug Unit
   participant CPU as cpu_core
   PC->>DU: LOAD_PROGRAM, LEN=2+4N, N, palabras
-  DU->>CPU: cpu_rst
-  DU->>DU: escribe imem, valida longitud
+  DU->>DU: valida encabezado (LEN, N)
+  DU->>CPU: cpu_rst (activo durante la carga)
+  DU->>DU: escribe imem
+  DU->>CPU: libera cpu_rst
   DU-->>PC: OK, state=READY
   PC->>DU: RUN
   DU-->>PC: OK, state=RUNNING

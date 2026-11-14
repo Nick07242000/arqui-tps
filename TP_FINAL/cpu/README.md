@@ -1826,3 +1826,280 @@ La salida termina con `RESULTADO: PASS` o `RESULTADO: FAIL`.
 | Aislamiento entre imágenes de distinta longitud | Hoy los programas de prueba terminan en `jal x0, 0`. La protección real contra instrucciones residuales llega con `N_WORDS` y `HALT` (US-4.3). |
 | Secuencia de reset de la Debug Unit | Se define aquí como contrato y se prueba con una Debug Unit emulada. Su implementación es parte de E5. |
 | Reset de encendido (`sys_rst`) | Su sincronización con el botón externo se resuelve en la integración del top-level (E7). |
+
+## Carga de programa y reprogramación
+
+### Qué problema resuelve
+
+El procesador debe poder cambiar de programa **sin volver a sintetizar la FPGA**. Para eso la memoria de programa se escribe en tiempo de ejecución: un mensaje llega byte a byte, se valida y recién entonces el programa queda disponible para ejecutarse.
+
+El bloque que se encarga de esto es `program_loader`. Su trabajo, en cinco frases:
+
+1. Recibe el mensaje de carga (cantidad de palabras + palabras de la imagen).
+2. **Valida el encabezado antes de tocar nada.** Si es inválido, el programa que ya estaba cargado y el estado de la CPU quedan exactamente como estaban.
+3. Si es válido, invalida el programa anterior, mantiene la CPU en reset y escribe cada palabra de 32 bits en `program_memory`.
+4. **Solo declara el programa nuevo válido si el mensaje llegó completo.**
+5. Informa el resultado con un pulso de fin y un código de error.
+
+> **Alcance.** `program_loader` trabaja sobre una secuencia de bytes y no sabe qué es una UART. La Debug Unit (E5) le entregará los bytes del comando `LOAD_PROGRAM` ya separados del encabezado del protocolo. Por eso esta historia se puede probar completa en simulación antes de tener UART.
+
+### Dónde encaja
+
+```mermaid
+flowchart LR
+  DU["debug_unit<br/>(E5)"] -->|"i_load_start, LEN,<br/>bytes del payload"| PL["program_loader"]
+  PL -->|"escritura:<br/>enable, direccion, dato"| IMEM["program_memory"]
+  PL -->|"o_cpu_reset"| CPU["cpu_core"]
+  PL -->|"o_program_valid,<br/>o_n_words"| DU
+  PL -->|"o_load_finished,<br/>o_load_error_code"| DU
+  IMEM -->|"instrucciones"| CPU
+```
+
+| Quién | Qué hace con el loader |
+| --- | --- |
+| **Debug Unit** | Avisa que empieza una carga, le pasa los bytes y espera el pulso de fin. Con el resultado arma la respuesta UART y decide el estado del sistema. Acepta `RUN` mirando `o_program_valid`. |
+| **`program_memory`** | Recibe las palabras por su puerto de escritura, sin saber quién las envía. |
+| **`cpu_core`** | Recibe `o_cpu_reset`: queda con PC, registros y pipeline en su estado inicial mientras se reescribe la imagen. |
+
+### Formato de la carga
+
+#### La imagen
+
+Un programa es una secuencia de **palabras de 32 bits** (una por instrucción). Su largo, `N_WORDS`, debe estar entre **1 y 1024** (la capacidad de `program_memory`). Todo valor multibyte viaja en **little-endian**, el byte menos significativo primero.
+
+#### El payload de `LOAD_PROGRAM`
+
+```text
+[ N_WORDS : 2 bytes ] [ palabra 0 : 4 bytes ] [ palabra 1 : 4 bytes ] ... [ palabra N-1 : 4 bytes ]
+```
+
+El largo total del payload (`LEN`, que ya viene en el encabezado del protocolo) debe ser exactamente `2 + 4 × N_WORDS`.
+
+**Ejemplo.** Un programa de 2 palabras, `addi x1, x0, 10` (`0x00A00093`) y `jal x0, 0` (`0x0000006F`):
+
+| Byte | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Valor | `02` | `00` | `93` | `00` | `A0` | `00` | `6F` | `00` | `00` | `00` |
+| Significa | N_WORDS = 2 | | palabra 0 | | | | palabra 1 | | | |
+
+`LEN = 2 + 4 × 2 = 10`.
+
+### El módulo `program_loader`
+
+#### Interfaz
+
+| Señal | Dir. | Ancho | Significado |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Reloj único del sistema |
+| `i_reset` | in | 1 | Reset de sistema (encendido o botón) |
+| `i_load_start` | in | 1 | Pulso de 1 ciclo: comienza una carga |
+| `i_payload_length_bytes` | in | 16 | `LEN` del mensaje; válido junto con `i_load_start` |
+| `i_byte_valid` | in | 1 | Pulso de 1 ciclo: `i_byte_data` es el siguiente byte del payload |
+| `i_byte_data` | in | 8 | Byte del payload |
+| `o_imem_write_enable` | out | 1 | Escribir una palabra en `program_memory` |
+| `o_imem_write_word_addr` | out | 10 | Índice de la palabra a escribir |
+| `o_imem_write_data` | out | 32 | Palabra a escribir |
+| `o_cpu_reset` | out | 1 | En 1 mientras se reescribe la imagen: la CPU permanece en reset |
+| `o_program_valid` | out | 1 | Hay una imagen completa y validada |
+| `o_n_words` | out | 11 | Largo de la imagen (0 si no hay programa válido) |
+| `o_load_finished` | out | 1 | Pulso de 1 ciclo: la carga terminó, bien o mal |
+| `o_load_error_code` | out | 2 | Resultado (ver §4.3); estable hasta la siguiente carga |
+
+Parámetros: `ADDR_WIDTH` (10, índice de palabra de la memoria) y `RX_TIMEOUT_CYCLES` (2 700 000 = 100 ms a 27 MHz).
+
+Reglas de uso: el primer byte debe llegar **al menos un ciclo después** de `i_load_start`; y un `i_load_start` que llega con una carga en curso se **ignora**.
+
+#### Cómo funciona
+
+El loader es una máquina de estados con cinco estados:
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> RECEIVE_COUNT_LOW: i_load_start (LEN >= 2)
+  IDLE --> DISCARD_BYTES: i_load_start (LEN < 2)
+  RECEIVE_COUNT_LOW --> RECEIVE_COUNT_HIGH: byte
+  RECEIVE_COUNT_HIGH --> RECEIVE_WORDS: N_WORDS y LEN validos
+  RECEIVE_COUNT_HIGH --> DISCARD_BYTES: N_WORDS o LEN invalidos
+  RECEIVE_WORDS --> IDLE: ultima palabra escrita (carga OK)
+  DISCARD_BYTES --> IDLE: mensaje consumido (error de encabezado)
+  RECEIVE_COUNT_LOW --> IDLE: timeout
+  RECEIVE_COUNT_HIGH --> IDLE: timeout
+  RECEIVE_WORDS --> IDLE: timeout
+  DISCARD_BYTES --> IDLE: timeout
+```
+
+| Estado | Qué hace |
+| --- | --- |
+| `IDLE` | Espera `i_load_start`. Al llegar, toma `LEN` y empieza a recibir. **No modifica el programa ni la CPU.** |
+| `RECEIVE_COUNT_LOW` / `HIGH` | Recibe los dos bytes de `N_WORDS`. Con el segundo valida el encabezado completo. Si es válido, **recién ahí** invalida el programa anterior y la CPU entra en reset. |
+| `RECEIVE_WORDS` | Recibe las palabras. Junta los primeros tres bytes de cada una y, al llegar el cuarto, la escribe en la dirección siguiente (0, 1, 2…). La CPU está en reset durante todo este estado. |
+| `DISCARD_BYTES` | Hubo un error en el encabezado: consume los bytes que faltan sin escribir nada, para que el flujo no quede desincronizado. |
+
+Tres decisiones de funcionamiento conviene tener presentes:
+
+- **El encabezado se valida completo antes de tocar nada.** Un `N_WORDS` o un `LEN` inválidos no escriben `program_memory`, no invalidan el programa cargado y no resetean la CPU.
+- **Hay un punto de no retorno: el encabezado válido.** A partir de ahí la memoria se va a sobrescribir, así que el programa anterior se invalida. Si la carga se interrumpe después, el sistema queda sin programa.
+- **El programa nuevo pasa a válido en el mismo ciclo en que se escribe la última palabra.** Cuando se ve `o_program_valid = 1`, todas las palabras ya están en la memoria.
+
+#### Qué errores detecta
+
+| Situación | Código | Se mapea a | Qué ocurre |
+| --- | --- | --- | --- |
+| `N_WORDS = 0` o `N_WORDS > 1024` | `LOAD_ERROR_ARGUMENT` | `ERR_ARG` | No se escribe nada; se consume el mensaje. **Programa y CPU se conservan** |
+| `LEN ≠ 2 + 4 × N_WORDS`, o `LEN < 2` | `LOAD_ERROR_LENGTH` | `ERR_LEN` | No se escribe nada; se consume el mensaje. **Programa y CPU se conservan** |
+| 100 ms sin recibir un byte **antes de validar el encabezado** | `LOAD_ERROR_TIMEOUT` | `ERR_TIMEOUT` | Se abandona. **Programa y CPU se conservan** |
+| 100 ms sin recibir un byte **después de validar el encabezado** (carga truncada) | `LOAD_ERROR_TIMEOUT` | `ERR_TIMEOUT` | Se abandona. Pueden haber quedado escritas palabras completas, pero el programa **no es válido** |
+| Todo correcto | `LOAD_ERROR_NONE` | `OK` | Programa válido, `o_n_words = N_WORDS` |
+
+Si `N_WORDS` y `LEN` fallan a la vez, se informa `ARGUMENT`.
+
+**Sobre las "direcciones inválidas".** El loader no recibe direcciones: las genera él con un contador que arranca en 0 y avanza de a una palabra. Como `N_WORDS ≤ 1024` se valida *antes* de la primera escritura, es imposible escribir fuera de la memoria.
+
+#### Estado del sistema según cómo termina la carga
+
+| Elemento | Error antes de validar el encabezado | Interrumpida después de validarlo | Carga correcta |
+| --- | --- | --- | --- |
+| CPU | **Sin cambios** | En reset durante la carga; queda reseteada | Reseteada: PC = 0, pipeline vacío |
+| Registros `x1`–`x31` | **Se conservan** | En 0 | En 0 |
+| Memoria de datos | Se conserva | Se conserva | Se conserva |
+| Memoria de programa | **Sin cambios** | Se sobrescriben las palabras que llegaron completas | Las primeras `N_WORDS` son la nueva imagen; el resto conserva la imagen anterior sin borrarse |
+| `o_program_valid` | **Se conserva** (1 si había programa) | 0 | 1 |
+| `o_n_words` | **Se conserva** | 0 | `N_WORDS` |
+
+Esto responde en la práctica a las preguntas de la consigna sobre reprogramación: **no hace falta borrar la memoria de programa** (el límite `N_WORDS` acota qué se ejecuta), **no hace falta borrar la memoria de datos** (cada programa inicializa lo que usa), pero **sí se limpian registros y pipeline** (lo hace el reset que el loader mantiene mientras reescribe la imagen).
+
+### Cómo se conecta (contrato para la Debug Unit, E5)
+
+Secuencia que seguirá la Debug Unit al recibir `LOAD_PROGRAM`:
+
+```mermaid
+sequenceDiagram
+  participant PC as Cliente PC
+  participant DU as Debug Unit
+  participant PL as program_loader
+  PC->>DU: [0x01][LEN][payload...]
+  DU->>PL: i_load_start + LEN
+  loop LEN bytes
+    DU->>PL: i_byte_valid + i_byte_data
+  end
+  PL-->>DU: o_load_finished + o_load_error_code
+  DU-->>PC: OK o error (segun el codigo)
+```
+
+Reglas que la Debug Unit debe respetar:
+
+| Regla | Motivo |
+| --- | --- |
+| Reenviar al loader **exactamente `LEN` bytes** del payload y esperar `o_load_finished` antes de leer el siguiente comando | El loader consume el mensaje completo aun en error; así el flujo queda sincronizado |
+| Traducir `o_load_error_code` a `STATUS`: `NONE`→`OK`, `ARGUMENT`→`ERR_ARG`, `LENGTH`→`ERR_LEN`, `TIMEOUT`→`ERR_TIMEOUT` | Respuesta inequívoca por cada comando |
+| **Estado tras el fin de la carga:** éxito → `READY`; error con `o_program_valid = 1` → **el estado no cambia**; error con `o_program_valid = 0` → `EMPTY` | Con programa válido tras el error, el programa anterior y la CPU están intactos. Sin programa válido no hay nada que ejecutar |
+| Aceptar `RUN` y `STEP` **solo si** `o_program_valid = 1`; si no, responder `ERR_NO_PROGRAM` | Rechazar la ejecución con la carga incompleta (T4.2.4) |
+| Rechazar `LOAD_PROGRAM` con la CPU en `RUNNING` (`ERR_BUSY`) y no avanzar la CPU (`STEP`) mientras la carga está en curso | Durante el encabezado el loader todavía no resetea la CPU, así que la exclusión la garantiza la Debug Unit (ver ADR de exclusión por estado) |
+| En el top, combinar los resets: `cpu_rst = reset_de_la_DU \| o_cpu_reset \| sys_rst` | `cpu_core` tiene una sola entrada de reset |
+
+Además, `o_n_words` queda listo para que la US-4.3 lo use como límite de fetch (`fetch_ok = pc[31:2] < n_words`). Hasta entonces `cpu_core` no lo consume.
+
+### Verificación
+
+Hay dos testbenches con resultado esperado explícito. Se ejecutan con Icarus Verilog:
+
+```bash
+# Unitario: loader + program_memory real
+iverilog -g2005 -Wall -o sim_loader tb_program_loader.v program_loader.v program_memory.v
+vvp sim_loader
+
+# Integracion: loader + memorias + cpu_core
+iverilog -g2005 -Wall -o sim_reload tb_program_reload.v program_loader.v \
+  program_memory.v data_memory.v cpu_core.v alu.v branch_unit.v control_unit.v \
+  data_access_checker.v forwarding_unit.v hazard_unit.v immediate_generator.v \
+  load_data_extender.v mux.v register.v register_ex_mem.v register_id_ex.v \
+  register_if_id.v register_mem_wb.v registers.v store_data_formatter.v
+vvp sim_reload
+```
+
+Resultado: **`tb_program_loader`: PASS (105 verificaciones)** y **`tb_program_reload`: PASS (43 verificaciones)**.
+
+#### Testbench unitario (`tb_program_loader`)
+
+La memoria se lee de vuelta por su puerto de lectura y se compara con un modelo esperado. Tres monitores vigilan en todo momento que (a) nunca se escriba la memoria con la CPU fuera de reset, (b) nunca se escriba sobre un programa que todavía figura como válido y (c) el programa nunca sea válido mientras la CPU está en reset.
+
+| # | Caso | Qué demuestra |
+| --- | --- | --- |
+| 1 | Estado tras el reset | Arranca sin programa válido y sin carga en curso |
+| 2 | Carga de 3 palabras | Las palabras leídas son idénticas a las enviadas; CPU en reset al reescribirse la imagen |
+| 3 | 1024 palabras | La capacidad completa se carga y se lee correctamente |
+| 4 | Recarga más corta | Al validarse el encabezado el programa anterior se invalida; se sobrescriben las primeras palabras y el resto **no** se borra |
+| 5 | Bytes espaciados | Funciona con el ritmo de una UART real |
+| 6 | `N_WORDS = 0` | `ARGUMENT`; **programa conservado**, CPU sin resetear, memoria intacta |
+| 7 | `N_WORDS = 1025` | Igual que el anterior, se consume el mensaje y una carga posterior funciona |
+| 8 | `LEN` mayor / menor que lo declarado | `LENGTH`; programa conservado, CPU sin resetear, memoria intacta |
+| 9 | `LEN = 0` y `LEN = 1` | `LENGTH` sin quedar bloqueado; programa conservado |
+| 10 | Mensaje truncado | Antes del encabezado válido (medio encabezado, ningún byte): `TIMEOUT` y **programa conservado**. Después (palabras): `TIMEOUT` y programa inválido |
+| 11 | Encabezado inválido sin programa previo | Sigue sin programa; no aparece uno válido de la nada |
+| 12 | `i_load_start` en plena carga | Se ignora; la carga original termina bien |
+| 13 | Reset de sistema durante la carga (en el encabezado y en las palabras) y después | Aborta sin pulso de fin; deja el sistema sin programa |
+
+#### Testbench de integración (`tb_program_reload`)
+
+Usa los módulos reales (loader, memorias y `cpu_core`) y emula a la Debug Unit, incluyendo la regla "`RUN` solo con programa válido". Los programas se ensamblaron además con el ensamblador RISC-V de referencia (binutils) para cotejar las codificaciones.
+
+| Programa | Contenido | Resultado esperado |
+| --- | --- | --- |
+| **A** (6 palabras) | `x1=10`, `x2=32`, `x3=x1+x2`, `sw x3,0(x0)`, `x5=7` | `x3 = 42`, `x5 = 7`, `dmem[0] = 42` |
+| **B** (4 palabras, más corto) | `lw x6,0(x0)`, `x7=x6+1`, `sw x7,4(x0)` | `x6 = 42`, `x7 = 43`, `dmem[1] = 43`, **`x5 = 0`** |
+
+Secuencia y lo que demuestra cada paso:
+
+1. `RUN` sin programa → rechazado.
+2. Carga y ejecución de **A** → resultados correctos y `program_memory` idéntica a la imagen.
+3. **Encabezado inválido** (`N_WORDS = 0`) con A ya ejecutado: A sigue válido con `N_WORDS = 6`, `program_memory` conserva la imagen, **los registros conservan los resultados de A** (la CPU no se reseteó) y `RUN` se acepta y A vuelve a ejecutarse bien.
+4. Carga de **B interrumpida** después de un encabezado válido (llegan 2 de 4 palabras) mientras se fuerza `i_cpu_en = 1`: los registros quedan en 0 y la CPU no avanza (**CPU detenida durante la carga**). Al vencer el timeout el programa queda inválido, `RUN` se rechaza y la memoria de datos conserva `dmem[0] = 42`.
+5. Carga completa de **B** sobre el mismo hardware → `x6 = 42` (lee el dato que dejó A: la memoria de datos persiste) y `x5 = 0` (los registros de A fueron limpiados por la carga).
+6. Recarga de **A** → se repite el resultado original (reprogramación repetible).
+
+#### Las pruebas detectan fallas
+
+Para asegurar que los testbenches no aprueban por casualidad, se inyectaron 17 fallas en el loader. Entre ellas, las que definen este comportamiento: invalidar el programa o resetear la CPU **al iniciar** la carga (la versión anterior del loader), no invalidar el programa al validar el encabezado, no limpiar `n_words`, o invalidar el programa ante un encabezado inválido. También: orden de bytes invertido, sin chequeo de rango, `LEN` que siempre coincide, `LEN < 2` no detectado, sin timeout, error que no consume el mensaje, dirección de escritura corrida, escritura antes del cuarto byte, `i_load_start` aceptado en plena carga y programa válido tras un timeout. **Las 17 fueron detectadas por el testbench unitario.** El de integración detectó 11; las 6 restantes son validaciones del encabezado y del protocolo que cubre el unitario.
+
+#### Trazabilidad con los criterios de la US
+
+| Criterio de aceptación | Evidencia |
+| --- | --- |
+| Las palabras cargadas se leen idénticas a las enviadas | Unitario, casos 2 a 5 (incluye 1024 palabras) |
+| Se detectan cargas truncadas, tamaños excesivos y direcciones inválidas | Unitario, casos 6 a 10; direcciones inválidas imposibles por construcción (§4.3) |
+| Un comando de carga inválido no corrompe CPU ni memorias | Unitario, casos 6 a 10 (antes del encabezado válido); integración, paso 3 |
+| La reprogramación no requiere nueva síntesis | Integración, pasos 2, 5 y 6: A → B → A sobre el mismo hardware |
+| CPU detenida y `RUN` rechazado con la carga incompleta (T4.2.4) | Integración, pasos 1 y 4 |
+| Carga y ejecución de A seguida de B (T4.2.5) | Integración, pasos 2 a 6 |
+
+### Recursos estimados
+
+Estimación con Yosys (`synth_gowin`) para el loader con sus parámetros por defecto: **≈ 110 flip-flops y ≈ 240 LUT** (alrededor del 1,2 % de las LUT4 de la Tang Nano 20K). El grueso son los contadores (timeout de 22 bits, bytes restantes de 16 bits) y el buffer de 24 bits para armar cada palabra. El tiempo de espera medido en simulación con los valores reales es de 2 700 002 ciclos, o sea 100 ms a 27 MHz. Verificar el número final con Gowin EDA.
+
+### Decisiones de diseño y puntos a confirmar
+
+**Decisiones tomadas** (detalle en las ADR de esta historia):
+
+- El loader es un bloque separado de la Debug Unit y trabaja sobre bytes, sin conocer la UART.
+- El timeout de 100 ms vive dentro del loader, de modo que la detección de cargas truncadas se prueba sin la Debug Unit.
+- El encabezado se valida completo antes de tocar el programa anterior, la CPU o la memoria.
+- La CPU se mantiene en reset desde que el encabezado es válido hasta el final de la carga.
+
+**Puntos a confirmar:**
+
+| Tema | Situación |
+| --- | --- |
+| La arquitectura debe actualizarse | La matriz comando × estado (§7.3) y el diagrama de estados (§7.2) dicen que `LOAD_PROGRAM` con error termina siempre en `EMPTY`; el paso 1 de §8.4 invalida el programa y aplica `cpu_rst` al recibir el comando. Con este loader: un error de encabezado, o un timeout antes de validarlo, **no cambia el estado**; solo un timeout con el encabezado ya válido lleva a `EMPTY`. Esto además resuelve la tensión con la regla 3 del parser (§8.3): "un comando inválido no toca CPU ni memorias". |
+| Momento del reset de la CPU | El documento de arquitectura lo ubica en el fin de `LOAD_PROGRAM` (§1.3) y al inicio (§8.4). El loader lo aplica desde que el encabezado es válido hasta el fin de la carga, lo que deja la CPU limpia al terminar. |
+| `o_n_words` todavía no limita el fetch | Se usará en la US-4.3. Mientras tanto, los programas de prueba terminan con `jal x0, 0` (convención ya adoptada para los testbenches). |
+| Palabras parciales tras un timeout con encabezado válido | Pueden quedar escritas, pero con `o_n_words = 0` y `o_program_valid = 0` nunca se ejecutan. |
+
+### Archivos
+
+| Archivo | Contenido |
+| --- | --- |
+| `program_loader.v` | Módulo de carga |
+| `program_loader_defs.vh` | Códigos de resultado `LOAD_ERROR_*` |
+| `tb_program_loader.v` | Testbench unitario |
+| `tb_program_reload.v` | Testbench de integración (carga A → B) |

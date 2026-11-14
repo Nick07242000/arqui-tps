@@ -546,3 +546,98 @@ Los testbenches de la US-3.4 necesitan un CPU que ejecute programas, pero todav�
 - La limpieza por jerarquía (`data_mem.byte_bank[n].bank[...]`) es un atajo solo de simulación y depende del nombre del bloque `generate` de `data_memory`. Si se renombra, hay que actualizar la tarea `clear_data_memory_words`.
 - Al implementar la US-4.3, los programas de prueba pueden pasar a terminar en `HALT` y la convención del salto a sí mismo se retira.
 - Los programas de prueba se arman con el mini-ensamblador `test_instruction_encoders.vh`, cotejado con un desensamblador externo, y no con hexadecimal escrito a mano.
+
+## ADR - Módulo `program_loader` separado de la Debug Unit, con timeout propio
+
+### Contexto
+
+La carga de un programa es el primer comando que la Debug Unit debe ejecutar y la US-4.2 se implementa antes que la UART y la Debug Unit (E5). Hay que decidir dónde vive la lógica que recibe el payload de `LOAD_PROGRAM`, lo valida y escribe `program_memory`.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Implementarla dentro de la Debug Unit, junto con el parser de comandos. |
+| **A** | **Un módulo `program_loader` que trabaja sobre una secuencia de bytes, con su propio timeout entre bytes.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Se puede probar completo (validaciones, carga truncada, reprogramación) en simulación sin UART ni parser, alineado con el orden del roadmap (E4 antes que E5).
+- La Debug Unit queda como frontera con el protocolo: decodifica el encabezado `[CMD][LEN]` y le entrega los bytes del payload al loader, sin conocer el formato interno de la imagen.
+- Con el timeout dentro del loader, el criterio "se detectan cargas truncadas" se verifica en esta historia y no queda pendiente de E5.
+
+### Consecuencias
+
+- El timeout de 100 ms existe en dos lugares: el loader para `LOAD_PROGRAM` y el parser de la Debug Unit para el resto de los comandos, que tienen payloads de pocos bytes.
+- La Debug Unit debe reenviar exactamente `LEN` bytes y esperar `o_load_finished` antes de leer el comando siguiente.
+- Los nombres del roadmap son sugeridos: `program_loader` no figura en la tabla de módulos del documento de arquitectura (§2) y conviene agregarlo.
+
+## ADR - El encabezado se valida antes de invalidar el programa, resetear la CPU o escribir
+
+### Contexto
+
+El mensaje trae `N_WORDS` y `LEN`, que deben ser coherentes. Si no lo son, hay que decidir qué se hace con el programa que ya estaba cargado y con la CPU, y qué se hace con los bytes restantes. La arquitectura (§7.3, §8.4) invalida el programa y aplica `cpu_rst` al recibir el comando, de modo que toda carga con error termina en `EMPTY`; pero la regla 3 del parser (§8.3) y el criterio de la US-5.2 piden que un comando inválido no corrompa CPU ni memorias.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Escribir las palabras a medida que llegan y validar al final. |
+| A | Invalidar el programa y resetear la CPU al recibir `i_load_start`; validar el encabezado después. Toda carga con error termina en `EMPTY`. |
+| **B** | **Validar el encabezado completo antes de invalidar el programa, resetear la CPU o escribir. Ante un encabezado inválido, consumir los bytes restantes sin tocar nada.** |
+
+### Decisión
+
+**Opción B.**
+
+### Motivos
+
+- Un comando inválido no destruye el programa ya cargado ni el estado de la CPU: un error del cliente (por ejemplo, un `N_WORDS` mal calculado) no obliga a recargar.
+- Cumple literalmente la regla 3 del parser y el criterio de la US-5.2, sin excepciones para `LOAD_PROGRAM`.
+- Un `N_WORDS` o un `LEN` inválidos nunca llegan a escribir `program_memory`, y la dirección no puede salirse de rango por construcción.
+- Consumir el mensaje completo mantiene sincronizado el flujo (regla 1 del parser): los bytes de un comando inválido no se interpretan como comandos nuevos.
+- Cuando `N_WORDS` y `LEN` fallan a la vez se informa `ARGUMENT` (el dato declarado es el primer sospechoso).
+
+### Consecuencias
+
+- El encabezado válido es el punto de no retorno: desde ahí el programa anterior se invalida (`o_program_valid = 0`, `o_n_words = 0`) y la CPU entra en reset. Una carga que se interrumpe después de ese punto deja el sistema sin programa.
+- Un timeout antes de validar el encabezado también conserva el programa y la CPU.
+- La matriz comando × estado (§7.3), el diagrama de estados (§7.2) y los pasos 1 y 5 de §8.4 de la arquitectura deben actualizarse: `LOAD_PROGRAM` OK → `READY`; error con `o_program_valid = 1` → el estado no cambia; error con `o_program_valid = 0` → `EMPTY`.
+- La Debug Unit decide el estado a partir de `o_program_valid` después de `o_load_finished`.
+- Se necesita un contador de bytes restantes (16 bits) y un estado `DISCARD_BYTES`.
+- Tras un timeout con encabezado válido pueden quedar escritas palabras completas; no se ejecutan porque `o_n_words = 0` y `o_program_valid = 0`.
+
+## ADR - CPU en reset mientras se reescribe la imagen
+
+### Contexto
+
+Mientras se escribe `program_memory` la CPU no debe ejecutar. El documento de arquitectura ubica `cpu_rst` al inicio de `LOAD_PROGRAM` (§8.4) y también al fin (§1.3). Con la decisión anterior, el programa y la CPU no se tocan hasta validar el encabezado. Hay que decidir durante qué tramo de la carga la CPU permanece en reset.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Pulso de reset al inicio o al final de la carga; el resto del tiempo depende de que `cpu_en` esté en 0. |
+| A | `o_cpu_reset` en 1 durante toda la carga, desde `i_load_start`. |
+| **B** | **`o_cpu_reset` en 1 desde que el encabezado es válido hasta el fin de la carga (mientras dura la escritura de la imagen).** |
+
+### Decisión
+
+**Opción B.**
+
+### Motivos
+
+- Es coherente con la decisión anterior: la CPU no se resetea por un comando que luego se rechaza.
+- Desde el primer byte escrito hasta el final, la CPU no puede avanzar aunque la Debug Unit tuviera un error: en `cpu_core` el reset tiene prioridad sobre `cpu_en` (también anula los stores). La protección es del hardware y no del protocolo.
+- Cumple la política de carga: registros en 0 y pipeline vacío al finalizar, sin lógica adicional.
+- Invariante simple de verificar: toda escritura de `program_memory` ocurre con la CPU en reset y con el programa anterior ya invalidado.
+
+### Consecuencias
+
+- Durante el encabezado el loader no protege a la CPU: la Debug Unit debe rechazar `LOAD_PROGRAM` con la CPU en `RUNNING` (`ERR_BUSY`) y no avanzar la CPU mientras la carga está en curso.
+- El top debe combinar los resets: `cpu_rst = reset_de_la_DU | o_cpu_reset | sys_rst`.
+- `o_cpu_reset` es una decodificación combinacional del estado del loader (`state == RECEIVE_WORDS`) con fanout hacia todos los flip-flops del CPU. Si en E7 resultara crítico, se registra la señal.
