@@ -1,10 +1,6 @@
 `timescale 1ns / 1ps
 `include "program_loader_defs.vh"
 
-// -----------------------------------------------------------------------------
-// Testbench de program_loader conectado a una program_memory real.
-// Emula a la Debug Unit: entrega i_load_start, LEN y los bytes del payload.
-// -----------------------------------------------------------------------------
 module tb_program_loader;
 
     localparam ADDR_WIDTH        = 10;

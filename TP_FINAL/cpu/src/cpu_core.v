@@ -24,7 +24,14 @@ module cpu_core #(
 
     // ---- Consulta de registros (solo lectura) -------------------------------
     input  wire [4:0]                i_debug_reg_addr,
-    output wire [31:0]               o_debug_reg_data
+    output wire [31:0]               o_debug_reg_data,
+
+    // ---- Control de ejecucion (Debug Unit) ----------------------------------
+    input  wire [MEM_ADDR_WIDTH:0]   i_n_words,         // largo de la imagen cargada
+    output wire [31:0]               o_pc,
+    output wire                      o_halting,         // HALT confirmado
+    output wire                      o_done,            // sin busqueda y pipeline vacio
+    output wire [1:0]                o_done_reason      // ver done_reason_defs.vh
 );
 
     // Escritura de WB hacia el banco de registros (se asigna en la etapa WB)
@@ -42,6 +49,10 @@ module cpu_core #(
     wire [1:0]  ex_forward_a_select;
     wire [1:0]  ex_forward_b_select;
 
+    // Resultado del control de fin de ejecucion, consumido por IF y por la unidad de riesgos
+    wire        fetch_is_stopped;
+    wire        ex_halt_commit;
+
 
     // =========================================================================
     // IF - Instruction Fetch
@@ -49,10 +60,13 @@ module cpu_core #(
     wire [31:0] if_pc;
     wire [31:0] if_pc_plus_4 = if_pc + 32'd4;
     wire [31:0] if_next_pc;
-    wire        if_is_valid  = 1'b1;       // US-4.3: dependera del fin de la imagen
+    wire        if_is_valid  = !fetch_is_stopped;
 
     // En un stall se congelan PC, lectura de imem e IF/ID; el resto avanza
     wire        front_end_enable = i_cpu_en && !load_use_stall;
+
+    // Con la busqueda detenida el PC se retiene, salvo que EX lo redirija
+    wire        pc_enable = front_end_enable && (!fetch_is_stopped || ex_redirect);
 
     // El PC sigue en secuencia salvo que EX redirija el flujo
     mux #(.DATA_WIDTH(32), .INPUT_COUNT(2)) next_pc_mux (
@@ -64,10 +78,12 @@ module cpu_core #(
     register #(.DATA_WIDTH(32)) program_counter (
         .i_clk    (i_clk),
         .i_reset  (i_cpu_reset),
-        .i_enable (front_end_enable),
+        .i_enable (pc_enable),
         .i_data   (if_next_pc),
         .o_data   (if_pc)
     );
+
+    assign o_pc = if_pc;
 
     assign o_imem_read_enable = front_end_enable;
     assign o_imem_word_addr   = if_pc[MEM_ADDR_WIDTH+1:2];
@@ -433,6 +449,7 @@ module cpu_core #(
         .i_id_ex_mem_read (id_ex_mem_read),
         .i_id_ex_rd_addr  (id_ex_rd_addr),
         .i_ex_redirect    (ex_redirect),
+        .i_halt_commit    (ex_halt_commit),
         .o_stall          (load_use_stall),
         .o_flush_front    (front_end_flush)
     );
@@ -449,6 +466,28 @@ module cpu_core #(
         .i_mem_wb_rd_addr   (mem_wb_rd_addr),
         .o_forward_a_select (ex_forward_a_select),
         .o_forward_b_select (ex_forward_b_select)
+    );
+
+
+    // =========================================================================
+    // Fin de ejecucion: HALT, fin de imagen y vaciado del pipeline
+    // =========================================================================
+    halt_controller #(.ADDR_WIDTH(MEM_ADDR_WIDTH)) end_of_execution (
+        .i_clk           (i_clk),
+        .i_reset         (i_cpu_reset),
+        .i_enable        (i_cpu_en),
+        .i_fetch_pc      (if_pc),
+        .i_n_words       (i_n_words),
+        .i_if_id_valid   (if_id_valid),
+        .i_id_ex_valid   (id_ex_valid),
+        .i_id_ex_is_halt (id_ex_is_halt),
+        .i_ex_mem_valid  (ex_mem_valid),
+        .i_mem_wb_valid  (mem_wb_valid),
+        .o_halt_commit   (ex_halt_commit),
+        .o_halting       (o_halting),
+        .o_fetch_stopped (fetch_is_stopped),
+        .o_done          (o_done),
+        .o_done_reason   (o_done_reason)
     );
 
 endmodule

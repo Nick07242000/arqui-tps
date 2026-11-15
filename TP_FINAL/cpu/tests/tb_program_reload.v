@@ -1,12 +1,6 @@
 `timescale 1ns / 1ps
 `include "program_loader_defs.vh"
 
-// -----------------------------------------------------------------------------
-// Testbench de integracion de la US-4.2: program_loader + memorias + cpu_core.
-// Carga y ejecuta el programa A, luego reprograma con el programa B sin
-// resintetizar. Emula a la Debug Unit: envia los bytes de LOAD_PROGRAM y
-// acepta RUN solo si hay un programa valido.
-// -----------------------------------------------------------------------------
 module tb_program_reload;
 
     localparam CLK_PERIOD        = 10;

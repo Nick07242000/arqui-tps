@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // Control del front-end ante riesgos:
 //   - stall: dependencia load-use que el forwarding no puede resolver
-//   - flush: cambio de flujo resuelto en EX
+//   - flush: cambio de flujo o HALT resuelto en EX
 // -----------------------------------------------------------------------------
 module hazard_unit (
     // ---- Instruccion en ID --------------------------------------------------
@@ -18,6 +18,7 @@ module hazard_unit (
     input  wire       i_id_ex_mem_read,
     input  wire [4:0] i_id_ex_rd_addr,
     input  wire       i_ex_redirect,     // branch tomado, jal o jalr
+    input  wire       i_halt_commit,     // HALT valido
 
     output wire       o_stall,
     output wire       o_flush_front      // anula las instrucciones de IF e ID
@@ -40,10 +41,10 @@ module hazard_unit (
                   && (rs1_depends_on_load || rs2_depends_on_load);
 
     // -------------------------------------------------------------------------
-    // Flush por cambio de flujo
+    // Flush por cambio de flujo o por HALT
     // -------------------------------------------------------------------------
-    // Nunca coincide con o_stall: el stall exige un load en EX y el redirect,
-    // un branch o jump en EX.
-    assign o_flush_front = i_ex_redirect;
+    // Nunca coincide con o_stall: el stall exige un load en EX, y el redirect o
+    // el HALT, que la instruccion en EX sea un branch, un jump o el propio HALT.
+    assign o_flush_front = i_ex_redirect || i_halt_commit;
 
 endmodule

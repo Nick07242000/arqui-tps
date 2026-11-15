@@ -2103,3 +2103,190 @@ Estimación con Yosys (`synth_gowin`) para el loader con sus parámetros por def
 | `program_loader_defs.vh` | Códigos de resultado `LOAD_ERROR_*` |
 | `tb_program_loader.v` | Testbench unitario |
 | `tb_program_reload.v` | Testbench de integración (carga A → B) |
+
+## HALT custom y vaciado final (US-4.3)
+
+### ¿Qué problema resuelve?
+
+Un programa necesita una forma de decir "terminé", y el procesador necesita saber **cuándo es seguro mostrar el estado final**. No alcanza con detenerse apenas aparece la instrucción de parada: en ese momento todavía hay instrucciones anteriores a mitad de camino (un `sw` que no llegó a escribir la memoria, un `add` que no escribió su registro). Si el estado se consultara en ese instante, se vería un resultado incompleto.
+
+Esta historia agrega tres capacidades:
+
+1. **Reconocer `HALT`**, una instrucción custom de RISC-V con codificación fija `0x0000000B`.
+2. **Dejar de buscar instrucciones nuevas** cuando el programa terminó, ya sea por `HALT` o porque el PC llegó al final de la imagen cargada.
+3. **Esperar a que el pipeline se vacíe** y recién entonces declarar `done`, indicando el motivo de la finalización.
+
+El reloj nunca se detiene: todo se logra con señales de habilitación síncronas.
+
+### Cómo funciona, en pocas palabras
+
+```mermaid
+flowchart LR
+  EX["HALT valido en EX<br/>(halt_commit)"] -->|"solo si cpu_en"| H["halting = 1"]
+  EX -->|"flush"| F["se anulan las instrucciones<br/>de IF e ID"]
+  H --> S["fetch_stopped"]
+  PCOUT["PC fuera de la imagen<br/>(PC/4 >= N_WORDS)"] --> S
+  S --> IFS["IF deja de producir<br/>instrucciones validas"]
+  S --> D{"pipeline vacio?"}
+  V["valid de IF/ID, ID/EX,<br/>EX/MEM y MEM/WB"] --> D
+  D -->|"si"| DONE["done = 1<br/>motivo: HALT o END_OF_IMAGE"]
+```
+
+El proceso tiene tres momentos:
+
+| Momento | Qué ocurre |
+| --- | --- |
+| **Confirmación** | Cuando `HALT` llega a la etapa EX (y es una instrucción válida), se activa `halting` y se anulan las dos instrucciones más jóvenes: la que estaba en ID y la que se estaba buscando en IF. |
+| **Detención del fetch** | Desde el ciclo siguiente, IF ya no produce instrucciones válidas. Las instrucciones anteriores a `HALT` siguen avanzando; el propio `HALT` recorre MEM y WB sin ningún efecto. |
+| **Vaciado** | Cuando los cuatro latches (`IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB`) tienen `valid = 0`, se activa `done`. En ese punto todos los `WB` y todos los stores previos ya ocurrieron. |
+
+#### ¿Por qué se confirma en EX y no en ID?
+
+Una instrucción que está en ID todavía puede pertenecer al camino equivocado de un branch que se resuelve **ese mismo ciclo**. Si el procesador se detuviera al ver un `HALT` en ID, un `HALT` que está en un camino que luego se descarta podría frenar el programa por error. En EX la instrucción ya es no especulativa (solo EX puede redirigir el flujo), así que la decisión es definitiva.
+
+### Ejemplo: instrucciones posteriores a `HALT`
+
+Programa de 5 palabras: `addi x1,x0,1` · `HALT` · `addi x2,x0,2` · `addi x3,x0,3` · `sw x1,32(x0)`.
+
+Traza real obtenida de la simulación (cada columna es una etapa; `–` indica etapa sin instrucción válida):
+
+| Ciclo | IF | ID | EX | MEM | WB | `halting` |
+| :---: | --- | --- | --- | --- | --- | :---: |
+| 1 | `addi x1` | – | – | – | – | 0 |
+| 2 | `HALT` | `addi x1` | – | – | – | 0 |
+| 3 | `addi x2` | `HALT` | `addi x1` | – | – | 0 |
+| 4 | ~~`addi x3`~~ | ~~`addi x2`~~ | **`HALT`** ← se confirma | `addi x1` | – | 0 |
+| 5 | – | – | – | `HALT` | `addi x1` | 1 |
+| 6 | – | – | – | – | `HALT` | 1 |
+| 7 | – | – | – | – | – | 1 → **`done = 1`** |
+
+- En el ciclo 4, las dos instrucciones tachadas se anulan: nunca llegan a escribir un registro ni la memoria.
+- El `sw` (última palabra) ni siquiera llega a entrar al pipeline: la búsqueda ya está detenida.
+- El estado final es `x1 = 1`, `x2 = 0`, `x3 = 0`, y la memoria de datos queda intacta.
+
+**Regla práctica:** si no hay stalls ni saltos, un `HALT` ubicado en la posición `h` del programa deja el pipeline vacío `h + 5` ciclos después de comenzar la ejecución. Cada stall o salto tomado agrega sus ciclos de penalización.
+
+### Módulos
+
+#### `halt_controller`
+
+Concentra toda la lógica de fin de ejecución. No toca datos del programa: solo observa la validez de las etapas y el PC.
+
+| Señal | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk`, `i_reset` | in | 1 | Reloj y reset síncrono del CPU (`cpu_rst`). |
+| `i_enable` | in | 1 | El CPU avanza en este ciclo (`cpu_en`). |
+| `i_fetch_pc` | in | 32 | PC que se busca en IF. |
+| `i_n_words` | in | 11 | Largo de la imagen cargada (0 a 1024). |
+| `i_if_id_valid`, `i_id_ex_valid`, `i_ex_mem_valid`, `i_mem_wb_valid` | in | 1 | Validez de cada latch del pipeline. |
+| `i_id_ex_is_halt` | in | 1 | La instrucción en EX es `HALT` (la decodifica `control_unit`). |
+| `o_halt_commit` | out | 1 | `HALT` válido en EX: dispara el flush. |
+| `o_halting` | out | 1 | `HALT` ya confirmado. Se mantiene hasta el próximo reset. |
+| `o_fetch_stopped` | out | 1 | IF no debe producir instrucciones válidas. |
+| `o_done` | out | 1 | La ejecución terminó. |
+| `o_done_reason` | out | 2 | Motivo de la finalización (ver tabla más abajo). |
+
+Internamente tiene tres piezas, cada una de una o dos líneas:
+
+- **`halting`**: un flip-flop que se activa al confirmarse `HALT` y solo se borra con el reset. Cambia únicamente cuando `i_enable = 1`, para quedar sincronizado con el flush que acompaña al `HALT` (ver [modo paso a paso](#modo-paso-a-paso)).
+- **`fetch_stopped`** = `halting` **o** el PC está fuera de la imagen (`PC/4 ≥ N_WORDS`).
+- **`done`** = `fetch_stopped` **y** ninguno de los cuatro `valid` está en alto.
+
+#### `hazard_unit`
+
+Recibe una entrada nueva, `i_halt_commit`, y el flush del front-end pasa a ser:
+
+```verilog
+assign o_flush_front = i_ex_redirect || i_halt_commit;
+```
+
+El flush de un `HALT` reutiliza exactamente el mecanismo del salto tomado: limpia `IF/ID` y `ID/EX`. Sigue cumpliéndose que **nunca coincide con un stall** (el stall exige un `load` en EX; el flush exige un salto o el propio `HALT`).
+
+#### `cpu_core`
+
+| Cambio | Detalle |
+| --- | --- |
+| Puertos nuevos | `i_n_words`, `o_pc`, `o_halting`, `o_done`, `o_done_reason`. Son los que usará la Debug Unit en E5. |
+| `if_is_valid` | Antes era constante en 1. Ahora es `!fetch_is_stopped`: la instrucción buscada es válida solo si la búsqueda no está detenida. |
+| Enable del PC | Con la búsqueda detenida el PC **se retiene**, salvo que EX lo redirija (ver caso especial más abajo). |
+| Instancia nueva | `halt_controller`, ubicado al final del módulo junto a la sección de riesgos. |
+
+#### `done_reason_defs.vh`
+
+Define los códigos de motivo. Coinciden con el campo `done_reason` de `GET_STATUS`.
+
+| Valor | Nombre | Significado |
+| :---: | --- | --- |
+| 0 | `DONE_REASON_NONE` | La ejecución todavía no terminó. |
+| 1 | `DONE_REASON_HALT` | Terminó por la instrucción `HALT`. |
+| 2 | `DONE_REASON_END_OF_IMAGE` | El PC llegó al final de la imagen sin encontrar `HALT`. |
+
+`o_done_reason` vale `NONE` mientras `done` está en 0. Si ambas condiciones se dan a la vez, **`HALT` tiene prioridad** (ejemplo típico: `HALT` es la última palabra de la imagen, por lo que el PC también queda fuera de ella).
+
+### Casos especiales
+
+| Situación | Comportamiento |
+| --- | --- |
+| **`HALT` en el camino descartado de un branch** | Nunca llega a EX con `valid = 1`: se anula con el flush del branch. No detiene el programa. |
+| **Instrucciones después de `HALT`** | Las dos más cercanas se anulan por el flush; las siguientes no se buscan. Ninguna produce efectos. |
+| **Imagen sin `HALT`** | El PC llega a `4 · N_WORDS`, la búsqueda se detiene, el pipeline se vacía y se informa `END_OF_IMAGE`. Es la respuesta a la pregunta 5 de la consigna. |
+| **Branch o jump tomado en el borde de la imagen** | El fin de imagen **no es permanente**: si una instrucción en EX redirige el PC hacia el interior de la imagen, la búsqueda se reanuda. Por eso el enable del PC admite el redirect aunque la búsqueda esté detenida. |
+| **Salto con destino fuera de la imagen** | Termina por `END_OF_IMAGE`; el PC queda retenido en el destino del salto. |
+| **Palabras similares a `HALT`** | Solo `0x0000000B` es `HALT`. Otras palabras `custom-0` (por ejemplo `0x0000008B`) son instrucciones ilegales, se neutralizan y no detienen el CPU. |
+| **Programa con lazo infinito sin `HALT`** | Nunca termina. El usuario lo aborta con el comando `RESET`. |
+| **Reset o carga de un programa nuevo** | `halting` vuelve a 0, el PC a 0 y el pipeline queda vacío. Las instrucciones residuales de una imagen anterior no se ejecutan porque `N_WORDS` acota la búsqueda. |
+| **`N_WORDS = 0`** (sin programa) | `done` vale 1 trivialmente. La Debug Unit debe ignorarlo en los estados `EMPTY` y `LOADING`. |
+| **PC final** | Con `END_OF_IMAGE` queda en `4 · N_WORDS`. Con `HALT` en la dirección `H` queda en el menor entre `H + 12` y `4 · N_WORDS`: en el caso habitual de `HALT` como última palabra es `4 · N_WORDS`; si le siguen al menos tres palabras, es `H + 12` (ya se habían buscado dos instrucciones posteriores). Sirve solo como dato de depuración. |
+
+#### Modo paso a paso
+
+Con `cpu_en = 0` el CPU no avanza, y **tampoco cambia `halting`**. Si un `HALT` queda en EX mientras el procesador está pausado, el estado visible es coherente: `halting = 0`, el pipeline sin cambios y el `HALT` todavía en EX. Recién en el siguiente `STEP` se confirma, se hace el flush y `halting` pasa a 1, todo en el mismo flanco.
+
+#### Estabilidad después de `done`
+
+Con `done = 1` el CPU es **idempotente**: el PC está retenido, el pipeline vacío y no hay escrituras posibles. Por eso la Debug Unit puede dejar `cpu_en` en alto un ciclo de más (el tiempo que tarda en registrar `done`) sin alterar el estado final. No hace falta que `done` participe en la habilitación del CPU.
+
+### Verificación
+
+Todo se probó en simulación con el testbench `tb_halt_and_drain`, que emula a la Debug Unit: carga cada programa **como bytes a través del `program_loader` real**, controla `cpu_en` y compara registros, memoria de datos, motivo, PC y cantidad exacta de ciclos. Además, en toda ejecución continua comprueba que el pipeline esté vacío al terminar y que el estado no cambie durante cinco ciclos extra con `done` en alto; en todas las pruebas vigila que ninguna instrucción válida entre al pipeline después de `HALT`.
+
+| Prueba | Qué demuestra |
+| --- | --- |
+| `HALT` como única instrucción | Finalización mínima: 5 ciclos, motivo `HALT`. |
+| Instrucciones previas completan | Las escrituras de registros previas al `HALT` llegan al banco. |
+| Store inmediatamente anterior | El `sw` pegado al `HALT` queda escrito en la memoria antes de `done`. |
+| Load-use antes de `HALT` | El stall no pierde ni duplica el `HALT`. |
+| Instrucciones posteriores | Registros y memoria no se modifican; PC final = `H + 12` (hay tres palabras después del `HALT`). |
+| `HALT` en camino descartado | Un `HALT` anulado por un branch no detiene el programa. |
+| Palabras `custom-0` que no son `HALT` | Solo `0x0000000B` detiene el CPU. |
+| Imagen sin `HALT` | Termina por fin de imagen, `halting = 0`, PC = `4 · N_WORDS`. |
+| Branch en el borde de la imagen | Un lazo cuyo branch está en la última palabra sigue iterando (fin de imagen no permanente). |
+| Salto fuera de la imagen | Termina por `END_OF_IMAGE` con el PC en el destino. |
+| Reprogramación con imágenes más cortas | Un `HALT` residual justo en el borde de la imagen corta no se ejecuta; el estado de la imagen anterior no sobrevive. |
+| `RESET` y nueva ejecución | `halting` y `done` se limpian; la segunda ejecución es idéntica en resultados y ciclos. |
+| Paso a paso con pausas | Con `HALT` en EX y `cpu_en = 0`, `halting` sigue en 0 hasta el siguiente paso. |
+| Imagen de 1024 palabras | Caso límite de `PC/4` contra `N_WORDS = 1024` (PC = 4096). |
+
+**Resultado:** 14 pruebas y 715 verificaciones, todas aprobadas.
+
+Como control de calidad de las propias pruebas se inyectaron siete fallas en el RTL (por ejemplo: no permitir el redirect con la búsqueda detenida, actualizar `halting` sin `cpu_en`, omitir `MEM/WB` en el vaciado, no gatear `HALT` con `valid`, invertir la prioridad de motivos). **Las siete fueron detectadas.** Adicionalmente, se comparó la CPU modificada contra la anterior ciclo a ciclo con 300 programas aleatorios sin `HALT` y pausas aleatorias de `cpu_en`: no hubo ninguna diferencia, es decir, la historia no altera el comportamiento previo.
+
+Las palabras máquina de todos los programas de prueba se cotejaron con un desensamblador externo (Capstone).
+
+### Puntos a tener en cuenta para la integración
+
+1. **Testbenches existentes.** Los que instancian `cpu_core` deben conectar `.i_n_words(11'd1024)` (las salidas nuevas pueden quedar sin conectar). Los de `hazard_unit` deben conectar `.i_halt_commit(1'b0)`. Sin estas conexiones las entradas quedan en `z` y propagan `x`.
+2. **Debug Unit (E5).** Debe conectar `o_done`, `o_done_reason`, `o_halting` y `o_pc` a `GET_STATUS`, y alimentar `i_n_words` desde `o_n_words` del `program_loader`. Debe ignorar `done` cuando no hay programa válido.
+3. **Programas de prueba anteriores.** Los que terminaban en `jal x0, 0` pueden pasar a terminar en `HALT`, tal como anticipaba el ADR de convenciones de testbenches.
+4. **Timing (E7).** Se agregó el camino `PC → comparación con N_WORDS → if_is_valid` y la habilitación del PC depende ahora de `fetch_stopped` y de `ex_redirect`. Se revisan junto con el resto de los candidatos a camino crítico.
+5. **Documento de arquitectura (04).** Actualizar §11.5 (`front_end_flush` ya incluye `halt_commit`), §11.3 (los nombres `cpu_done`, `cpu_halting`, `cpu_pc` y `cpu_done_reason` son `o_done`, `o_halting`, `o_pc` y `o_done_reason` en el RTL) y el ADR de `pc_control`, que ahora queda resuelto (ver `ADRs_US-4.3.md`).
+
+### Archivos
+
+| Archivo | Estado |
+| --- | --- |
+| `halt_controller.v` | Nuevo |
+| `done_reason_defs.vh` | Nuevo |
+| `tb_halt_and_drain.v` | Nuevo |
+| `hazard_unit.v` | Modificado (entrada `i_halt_commit`, flush ampliado) |
+| `cpu_core.v` | Modificado (puertos, `if_is_valid`, enable del PC, instancia nueva) |

@@ -833,10 +833,10 @@ cycle 12   pc=0x00000014   state=PAUSED
 | `cpu_rst` | `debug_unit` → `cpu_core` | 1 | Reset síncrono del CPU (prioridad sobre `cpu_en`) |
 | `cpu_en` | `debug_unit` → `cpu_core`, memorias | 1 | Habilita el avance de un ciclo |
 | `n_words` | `debug_unit` → `cpu_core` | 11 | Longitud de la imagen cargada (0..1024) |
-| `cpu_done` | `cpu_core` → `debug_unit` | 1 | `fetch_stop && pipeline_vacío` |
-| `cpu_done_reason` | `cpu_core` → `debug_unit` | 2 | 1 = HALT, 2 = END_OF_IMAGE |
-| `cpu_halting` | `cpu_core` → `debug_unit` | 1 | HALT confirmado |
-| `cpu_pc` | `cpu_core` → `debug_unit` | 32 | PC actual |
+| `o_done` | `cpu_core` → `debug_unit` | 1 | `fetch_stop && pipeline_vacío` |
+| `o_done_reason` | `cpu_core` → `debug_unit` | 2 | 1 = HALT, 2 = END_OF_IMAGE |
+| `o_halting` | `cpu_core` → `debug_unit` | 1 | HALT confirmado |
+| `o_pc` | `cpu_core` → `debug_unit` | 32 | PC actual |
 | `flag_illegal`, `flag_dmem_oob`, `flag_misaligned` | `cpu_core` → `debug_unit` | 1+1+1 | Flags sticky |
 | `cycles`, `retired` | `cpu_core` → `debug_unit` | 32+32 | Contadores |
 | `dbg_reg_idx` | `debug_unit` → `cpu_core` | 5 | Registro a leer |
@@ -866,7 +866,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | `redirect` | `branch_unit` (EX) → `next_pc_mux`, `hazard_unit` | 1 | Branch/jump tomado |
 | `redirect_pc` | `branch_unit` (EX) → `next_pc_mux` | 32 | Destino |
 | `halt_commit` | EX → `halt_controller` | 1 | `HALT` válido en EX |
-| `front_end_flush` | `hazard_unit` → `IF/ID`, `ID/EX` | 1 | `redirect \|\| halt_commit` (hoy solo `redirect`; `halt_commit` se suma en US-4.3) |
+| `front_end_flush` | `hazard_unit` → `IF/ID`, `ID/EX` | 1 | `redirect \|\| halt_commit` |
 | `fwd_a`, `fwd_b` | `forwarding_unit` → EX | 2+2 | `00` ID/EX · `01` EX/MEM · `10` WB |
 | `wb_data` | WB → `registers`, EX (forward) | 32 | Resultado final de la instrucción en WB |
 | `wb_we`, `wb_rd` | WB → `registers` | 1, 5 | `memwb.valid && reg_write && rd≠0` |
@@ -903,7 +903,7 @@ cycle 12   pc=0x00000014   state=PAUSED
 | ADR-22 | Burbuja en `ID/EX` con `i_insert_bubble`, que limpia el latch completo | Solo `enable`; limpiar solo `valid` y controles | Un `enable` no alcanza: el load debe avanzar a `EX/MEM` mientras `ID/EX` recibe un vacío | `register_id_ex` tiene una entrada más, reutilizable para el flush de la US-3.3 |
 | ADR-23 | Forwarding por coincidencia de número de registro, sin `uses_rs` | Hacer viajar `uses_rs1/2` por los latches | Si el campo no es una fuente el valor adelantado se ignora; solo el stall necesita `uses_rs` | Cero FF extra |
 | ADR-24 | `branch_unit` combinacional que resuelve saltos en EX | Lógica inline en `cpu_core` | Testbench propio con casos límite; `cpu_core` queda como cableado | Un módulo y un testbench más |
-| ADR-25 | Próximo PC con `mux` en `cpu_core`, sin módulo `pc_control` | Módulo `pc_control` | Una sola señal de selección (`ex_redirect`); reutiliza `mux` | Reevaluar en US-4.3 si `fetch_stop` suma lógica |
+| ADR-25 | Próximo PC con `mux` en `cpu_core`, sin módulo `pc_control` | Módulo `pc_control` | Una sola señal de selección (`ex_redirect`); `fetch_stop` solo inhibe el `enable` del PC sin agregar lógica al mux | Decisión cerrada: se mantiene el `mux` en `cpu_core` sin crear `pc_control` |
 | ADR-26 | El flush se genera en `hazard_unit` (`i_ex_redirect` → `o_flush_front`) | `cpu_core` usa `ex_redirect` directo | Un solo lugar para stall y flush; US-4.3 suma `halt_commit` ahí | Hoy es una conexión directa |
 | ADR-27 | Flush de `IF/ID` con `i_insert_bubble` (misma semántica que `ID/EX`) | Entrada `i_flush` propia | Mismo nombre para el mismo comportamiento; no altera el pipeline con `cpu_en = 0` | `IF/ID.instr` no se limpia (sale de la BRAM) |
 | ADR-28 | Destino de `jalr` = resultado de la ALU; todo destino de salto se alinea con `[1:0]` en 0 | Segundo sumador en `branch_unit` | Evita un sumador de 32 bits; respeta el forwarding | Camino `forwarding → ALU → redirect → PC` candidato a crítico (E7) |

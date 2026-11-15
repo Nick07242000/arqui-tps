@@ -641,3 +641,116 @@ Mientras se escribe `program_memory` la CPU no debe ejecutar. El documento de ar
 - Durante el encabezado el loader no protege a la CPU: la Debug Unit debe rechazar `LOAD_PROGRAM` con la CPU en `RUNNING` (`ERR_BUSY`) y no avanzar la CPU mientras la carga está en curso.
 - El top debe combinar los resets: `cpu_rst = reset_de_la_DU | o_cpu_reset | sys_rst`.
 - `o_cpu_reset` es una decodificación combinacional del estado del loader (`state == RECEIVE_WORDS`) con fanout hacia todos los flip-flops del CPU. Si en E7 resultara crítico, se registra la señal.
+
+## ADR - El PC se retiene con la búsqueda detenida, salvo redirect
+
+### Contexto
+
+Cuando `HALT` se confirma o el PC sale de la imagen, IF deja de producir instrucciones válidas. Hay que decidir qué hace el registro del PC mientras tanto. El fin de imagen no es permanente: un branch o jump en EX puede devolver el PC al interior de la imagen.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | El PC sigue avanzando siempre; solo se invalida lo que se busca. |
+| A | El PC se retiene siempre que la búsqueda está detenida. |
+| **B** | **El PC se retiene con la búsqueda detenida, salvo que EX lo redirija.** |
+
+### Decisión
+
+**Opción B.**
+
+### Motivos
+
+- La opción 0 deja el PC corriendo después de `done`, por lo que el PC final no sirve para depurar y el CPU deja de ser idempotente con `done` en alto (la Debug Unit tarda un ciclo en registrarlo).
+- La opción A pierde el redirect de un branch tomado en la última palabra de la imagen: el lazo se rompería. Lo detectó la prueba del branch en el borde de la imagen al inyectar la falla.
+- La opción B mantiene ambas propiedades con un solo término extra: `pc_enable = front_end_enable && (!fetch_stopped || ex_redirect)`.
+
+### Consecuencias
+
+- Con `END_OF_IMAGE`, el PC queda en `4 · N_WORDS`. Con `HALT` queda en el menor entre `H + 12` y `4 · N_WORDS`.
+- `ex_redirect` ya alimentaba el selector del mux del próximo PC; ahora también el enable del PC. Se revisa en E7 junto con el camino `forwarding → ALU → redirect`.
+
+## ADR - `halting` solo cambia cuando el CPU avanza
+
+### Contexto
+
+`HALT` se confirma en EX y, en el mismo flanco, se anulan `IF/ID` e `ID/EX`. Esos latches solo capturan o se limpian con `cpu_en = 1`. En modo paso a paso, un `HALT` puede quedar en EX con el CPU pausado.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | `halting` se activa apenas `halt_commit` está en alto, aunque el CPU esté pausado. |
+| **A** | **`halting` se activa solo con `cpu_en = 1`, en el mismo flanco que el flush.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Con la opción 0, durante la pausa el CPU mostraría la búsqueda detenida pero el pipeline sin anular: un estado que no corresponde a ningún ciclo real.
+- La opción A mantiene el estado coherente: lo que se consulta con el CPU pausado es siempre el resultado de un número entero de ciclos.
+
+### Consecuencias
+
+- `halt_controller` recibe `i_enable`.
+- La prueba de paso a paso con pausas lo verifica: con `HALT` en EX y `cpu_en = 0`, `halting` permanece en 0.
+
+## ADR - `done` combinacional y motivo enmascarado
+
+### Contexto
+
+La Debug Unit necesita saber cuándo terminó la ejecución y por qué. Hay que decidir si `done` se registra o se deriva de las validez de las etapas, y qué vale el motivo mientras no terminó.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | `done` registrado; `done_reason` sin enmascarar. |
+| **A** | **`done` combinacional (`fetch_stopped` y los cuatro `valid` en 0); `done_reason` vale `NONE` mientras `done = 0`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Los `valid` ya son flip-flops: `done` es una compuerta sobre registros, sin camino largo.
+- Registrar `done` retrasaría un ciclo la finalización y obligaría a razonar sobre un ciclo de CPU "de más" ejecutándose.
+- Con el motivo en `NONE` hasta que `done` se activa, `GET_STATUS` puede copiar el campo sin lógica adicional (`0 = ninguna`).
+- Si `HALT` y fin de imagen coinciden, gana `HALT`: es la información más específica y el caso habitual.
+
+### Consecuencias
+
+- Con `N_WORDS = 0`, `done` vale 1 trivialmente; la Debug Unit lo ignora en `EMPTY` y `LOADING`.
+- Con `done = 1` el CPU es idempotente, así que un ciclo habilitado de más al registrar `done` no altera el estado.
+
+## ADR - Reevaluación de `pc_control` en la US-4.3
+
+### Contexto
+
+El ADR "Selección del próximo PC sin módulo `pc_control`" dejaba abierto reevaluar la extracción si la US-4.3 sumaba lógica de fetch (`fetch_stop`, límite `N_WORDS`).
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Crear `pc_control` con el PC, el mux del próximo PC, `fetch_stop` y el límite `N_WORDS`. |
+| **A** | **Mantener el PC y su mux en `cpu_core` y poner la lógica de fin de ejecución en `halt_controller`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- La lógica nueva (`halting`, `fetch_stopped`, `done`) trata del *fin de la ejecución*, no de elegir el próximo PC; el documento de arquitectura ya la ubicaba en `halt_controller`.
+- En `cpu_core` solo queda un término en el enable del PC y la validez de IF (`!fetch_is_stopped`).
+- Un `pc_control` mezclaría la selección del PC con el vaciado del pipeline, que depende de la validez de las cuatro etapas.
+
+### Consecuencias
+
+- `pc_control` sigue sin materializarse; el ADR anterior queda resuelto.
+- `halt_controller` expone `o_halt_commit`, que `cpu_core` entrega a `hazard_unit` para el flush, tal como anticipaba el ADR "Generación del flush en `hazard_unit`".
