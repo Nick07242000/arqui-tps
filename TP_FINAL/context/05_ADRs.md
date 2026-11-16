@@ -873,3 +873,122 @@ La prueba central de la US-4.4 compara, ciclo a ciclo, la ejecución paso a paso
 - Sin cambios de RTL.
 - La foto lee los registros por jerarquía (`cpu.register_file.registers`) y las etapas con `cpu.if_id_valid` y similares. Es un atajo de simulación que depende de esos nombres, igual que la limpieza de `data_memory` en el ADR de convenciones de los testbenches de riesgos estructurales.
 - Los programas de prueba se arman con un mini-ensamblador local de seis funciones dentro del testbench. Pueden reemplazarse por `test_instruction_encoders.vh` sin cambiar las pruebas.
+
+## ADR - UART sin buffers: pulso de un ciclo y dato estable
+
+### Contexto
+
+La tarea T5.1.3 pide definir buffers y el comportamiento ante overflow. El receptor entrega bytes a la Debug Unit y el transmisor los recibe de ella. Hay que decidir si cada sentido lleva una FIFO.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | FIFO en recepción y en transmisión, con indicadores de lleno/vacío y manejo de overflow. |
+| **A** | **Sin buffers: `uart_rx` entrega cada byte como un pulso de un ciclo (`o_byte_valid`) y `uart_tx` aplica contrapresión con `o_busy`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Entre dos bytes consecutivos pasan unos 2340 ciclos y la Debug Unit consume cada byte en el ciclo del pulso. Un byte no puede pisar a otro sin consumir.
+- El protocolo es estrictamente pregunta-respuesta: la PC no envía el comando siguiente hasta recibir la respuesta, y la FPGA no emite mensajes espontáneos.
+- Una FIFO agrega memoria, contadores de nivel y un camino de overflow que habría que probar, para cubrir un caso que el protocolo ya impide.
+- `o_byte_data` se mantiene estable hasta el byte siguiente, así que la Debug Unit lo puede leer también un ciclo tarde sin riesgo.
+
+### Consecuencias
+
+- La UART no absorbe ráfagas: la Debug Unit debe tomar `o_byte_data` en el ciclo en que `o_byte_valid` vale 1.
+- Un byte que la Debug Unit no espera (comando desconocido, bytes sobrantes) se entrega igual; es ella quien decide qué hacer.
+- Si una US futura incorporara mensajes asíncronos de la FPGA hacia la PC, habría que reevaluar esta decisión.
+
+## ADR - Tras un framing error el receptor espera la línea en reposo
+
+### Contexto
+
+Cuando el bit de stop llega en 0, la trama es inválida y el byte se descarta. Hay que decidir qué hace el receptor a continuación. Una línea atascada en 0 (break, cable desconectado) tiene el mismo aspecto que una cadena infinita de tramas con stop en 0.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Volver a `IDLE` de inmediato. |
+| **A** | **Pasar a un estado `WAIT_LINE_IDLE` y volver a `IDLE` recién cuando la línea valga 1.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Con la opción 0, una línea fija en 0 se interpretaría como un nuevo start cada 10 bits: un framing error cada ≈ 87 µs, que la Debug Unit tendría que procesar uno tras otro.
+- Con la opción A se informa un solo error por evento y el receptor retoma solo cuando la línea se libera.
+- Cuesta un estado y una condición de salida.
+
+### Consecuencias
+
+- Un emisor que envíe un stop en 0 seguido de un start inmediato, sin que la línea toque 1, pierde la trama siguiente. Es aceptable: no es tráfico válido, y el cliente espera ≥ 150 ms y vacía el buffer tras cualquier error (arquitectura §8.3).
+- Con la línea fija en 0 el receptor queda esperando sin generar actividad. Es una falla física que ninguna lógica puede resolver.
+- El testbench `tb_uart_rx` verifica que un break de más de cinco tramas produce exactamente un framing error.
+
+## ADR - Muestreo único en el centro del bit con confirmación del start
+
+### Contexto
+
+El receptor debe leer cada bit en un instante en que la línea sea estable. Hay que elegir la técnica de muestreo.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Sobremuestreo (por ejemplo x16) con voto por mayoría en cada bit. |
+| **A** | **Una muestra por bit en su centro, tras confirmar el start a medio bit.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Con 234 ciclos por bit, una única muestra en el centro deja un margen amplio: el receptor tolera aproximadamente de −4,7 % a +5,6 % de diferencia de velocidad (medido en simulación), contra un error real de 0,16 % entre 27 MHz y 115200 baudios.
+- La confirmación del start a medio bit descarta pulsos de ruido más cortos que medio bit sin lógica adicional.
+- El sobremuestreo agregaría un contador y la lógica de votación para mejorar la inmunidad al ruido en un enlace USB-UART corto, donde no es un problema esperado.
+
+### Consecuencias
+
+- No hay filtrado de ruido dentro de un bit. Un glitch de más de medio bit se toma como start y produce un byte espurio o un framing error.
+- Esos casos los cubren los timeouts del protocolo (100 ms en la Debug Unit, ≥ 150 ms de espera en el cliente).
+- El margen de tolerancia mínimo se verifica en `tb_uart_rx` con emisores ±2 % y ±4 %.
+
+## ADR - Pedido de transmisión con `o_busy` en 1: se ignora
+
+### Contexto
+
+`uart_tx` envía un byte por vez. La arquitectura (§11.2) indica que `tx_start` es válido solo con `!tx_busy`, pero hay que decidir qué hace el módulo si ese contrato se viola.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Aceptar el pedido y sobrescribir la trama en curso. |
+| A | Registro de retención de un byte: guardar el pedido y enviarlo al terminar la trama actual. |
+| **B** | **Ignorar el pedido; la trama en curso no se altera.** |
+
+### Decisión
+
+**Opción B.**
+
+### Motivos
+
+- La opción 0 corrompería el byte que ya está saliendo, y el receptor de la PC vería una trama defectuosa.
+- La opción A necesita 8 flip-flops más y un estado de «pendiente», para tolerar un error que la Debug Unit no debería cometer.
+- Ignorar el pedido protege la trama en curso con una guarda de una condición.
+
+### Consecuencias
+
+- Si la Debug Unit viola el contrato, el byte se pierde sin aviso. Se evita con la regla de uso: pedir solo con `o_busy` en 0.
+- `o_busy` cubre la trama completa, bit de stop incluido (2340 ciclos), de modo que pedir el byte siguiente en cuanto baja no acorta el stop anterior.
+- `o_busy` sube un ciclo después de que la Debug Unit pone `i_send_request` en 1. Hay que documentarlo para quien escriba el secuenciador de respuestas (US-5.2): no consultar `o_busy` en ese ciclo intermedio y mantener `i_send_request` como un pulso de un ciclo.
+- `tb_uart_tx` verifica el caso con pedidos justo tras aceptar, a mitad de trama y en el último ciclo con `o_busy` en 1.

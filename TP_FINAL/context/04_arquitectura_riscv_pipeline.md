@@ -624,9 +624,9 @@ Los registros devueltos con la CPU en `PAUSED` reflejan el estado previo al WB d
 | --- | --- |
 | Formato | 115200 baudios, 8-N-1 |
 | `uart_rx` | Sincronizador 2 FF; detecta flanco de start, muestrea en el centro del bit (`BAUD_DIV/2`), verifica stop. Salidas: `rx_data[7:0]`, `rx_valid` (pulso 1 ciclo), `rx_ferr` (pulso) |
-| `uart_tx` | Registro de desplazamiento; entradas `tx_data`, `tx_start` (válido solo con `!tx_busy`) |
+| `uart_tx` | Registro de desplazamiento; entradas `tx_data`, `tx_start` (pulso de 1 ciclo; si llega con `tx_busy = 1`, se ignora sin alterar la trama en curso) |
 | Buffers | **Ninguno.** Un byte tarda 86,8 µs ≈ 2343 ciclos y la DU consume cada byte en ≤ 1 ciclo; no hay riesgo de *overrun* |
-| Framing error | Byte descartado, mensaje en curso abortado con `ERR_FRAMING` |
+| Framing error | Byte descartado (`rx_data` sin cambios), mensaje en curso abortado con `ERR_FRAMING`; `uart_rx` espera a que la línea vuelva a reposo (1) antes de detectar un nuevo start (evita múltiples errores ante *break* o línea en 0) |
 
 ### 8.2 Formato de mensajes
 

@@ -2601,3 +2601,282 @@ Las decisiones están registradas como ADR:
   flip-flops y de las BRAM. Si en E7 su fanout limitara el timing, se puede replicar el registro.
 - **El testbench lee registros y latches por jerarquía** (`cpu.register_file.registers`, `cpu.if_id_valid`…).
   Es un atajo de simulación: si se renombran esas instancias hay que actualizar el testbench.
+
+## UART RX/TX
+
+| Archivo | Contenido |
+| --- | --- |
+| `uart_rx.v` | Receptor: del pin serie a bytes |
+| `uart_tx.v` | Transmisor: de bytes al pin serie |
+| `tb_uart_rx.v` | Pruebas del receptor |
+| `tb_uart_tx.v` | Pruebas del transmisor |
+| `tb_uart_loopback.v` | Pruebas de ambos conectados entre sí |
+
+### Qué resuelve
+
+La UART es el único camino físico entre la PC y la Debug Unit. Esta historia entrega los dos módulos que lo recorren:
+
+- **`uart_rx`** convierte lo que llega por el cable en bytes.
+- **`uart_tx`** convierte bytes en lo que sale por el cable.
+
+Ninguno de los dos sabe qué significa un byte. Qué es un `LOAD_PROGRAM` o un `RUN` lo decide la Debug Unit (US-5.2); la UART solo garantiza que **cada byte llega entero o no llega, y que ante cualquier error vuelve sola a un estado conocido**.
+
+```mermaid
+flowchart LR
+  PC["PC<br/>puente USB-UART"] -->|"uart_rx_pin"| RX["uart_rx"]
+  RX -->|"o_byte_data<br/>o_byte_valid<br/>o_framing_error"| DU["debug_unit<br/>(US-5.2)"]
+  DU -->|"i_byte_data<br/>i_send_request"| TX["uart_tx"]
+  TX -->|"o_busy"| DU
+  TX -->|"uart_tx_pin"| PC
+```
+
+### Decisiones de un vistazo
+
+| Tema | Decisión |
+| --- | --- |
+| Formato | 115200 baudios, 8-N-1, bit menos significativo primero |
+| Divisor | `(CLK_HZ + BAUD_RATE/2) / BAUD_RATE`: 234 ciclos por bit con 27 MHz |
+| Parámetros | `CLK_HZ` y `BAUD_RATE`: si cambia el clock (por ejemplo con un PLL), el divisor se recalcula solo |
+| Recepción | Sincronizador de 2 flip-flops, start confirmado a medio bit, una muestra por bit en su centro |
+| Entrega de un byte | Pulso de un ciclo; el dato queda estable hasta el byte siguiente |
+| Errores de recepción | Pulso de framing error; el byte se descarta; el receptor espera a que la línea vuelva a reposo |
+| Transmisión | Registro de desplazamiento con la trama completa; `o_busy` cubre toda la trama, stop incluido |
+| Buffers | Ninguno (ver sección 6) |
+| Reloj | Un único clock; los tiempos se miden contando ciclos, sin reloj derivado |
+
+### La trama y el divisor de baudios
+
+Cada byte viaja en una **trama de 10 bits**. La línea en reposo vale 1.
+
+| Posición | 0 | 1 a 8 | 9 |
+| --- | --- | --- | --- |
+| Contenido | Start (0) | D0, D1, … D7 (el menos significativo primero) | Stop (1) |
+| Duración | 234 ciclos | 234 ciclos cada uno | 234 ciclos |
+
+El hardware no mide tiempo en segundos sino en ciclos de clock, así que hay que decidir cuántos ciclos dura un bit:
+
+| Magnitud | Valor |
+| --- | --- |
+| Clock de la placa | 27 000 000 Hz |
+| Velocidad pedida | 115 200 baudios |
+| Ciclos por bit, exacto | 234,375 |
+| **Ciclos por bit usados** | **234** (se redondea al entero más cercano) |
+| Velocidad real | 27 000 000 / 234 ≈ 115 385 baudios |
+| Error respecto de la PC | +0,16 % |
+| Duración de un byte | 10 × 234 = 2340 ciclos ≈ 86,7 µs |
+
+Un error de 0,16 % es despreciable: el receptor tolera una diferencia de velocidad de aproximadamente −4,7 % a +5,6 % (sección 4.3).
+
+### `uart_rx` — el receptor
+
+#### Interfaz
+
+| Puerto | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Clock del sistema |
+| `i_reset` | in | 1 | Reset síncrono |
+| `i_rx_pin` | in | 1 | Pin de recepción. Es asíncrono: el módulo lo sincroniza internamente |
+| `o_byte_data` | out | 8 | Último byte recibido bien. Estable hasta que llega el siguiente |
+| `o_byte_valid` | out | 1 | Pulso de un ciclo: `o_byte_data` es un byte nuevo |
+| `o_framing_error` | out | 1 | Pulso de un ciclo: la trama no terminó con stop en 1 |
+
+`o_byte_valid` y `o_framing_error` nunca se activan en el mismo ciclo.
+
+#### Cómo funciona
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> START_BIT: linea en 0
+  START_BIT --> IDLE: a medio bit la linea volvio a 1 - ruido
+  START_BIT --> DATA_BITS: a medio bit la linea sigue en 0
+  DATA_BITS --> DATA_BITS: una muestra por bit
+  DATA_BITS --> STOP_BIT: 8 bits recibidos
+  STOP_BIT --> IDLE: stop en 1 - byte valido
+  STOP_BIT --> WAIT_LINE_IDLE: stop en 0 - framing error
+  WAIT_LINE_IDLE --> IDLE: linea en 1
+```
+
+1. **Sincronización.** El pin llega sin relación con el clock, así que pasa por dos flip-flops en cadena antes de usarse. Esto evita que una transición cercana a un flanco de clock deje al receptor en un estado indefinido (metaestabilidad).
+2. **Espera del start.** En `IDLE` el receptor espera que la línea baje a 0.
+3. **Confirmación del start.** Cuenta medio bit (117 ciclos) y vuelve a mirar la línea. Si sigue en 0 es un start real; si ya volvió a 1 fue ruido y se ignora, sin error.
+4. **Datos.** Desde ahí mide un bit completo (234 ciclos) por cada muestra, de modo que cada lectura cae **en el centro del bit**, lejos de las transiciones. Los bits entran por la izquierda de un registro de desplazamiento; como llegan del menos al más significativo, después de 8 muestras el byte ya queda ordenado.
+5. **Stop.** Una muestra más, un bit después. Si vale 1 la trama es correcta y se entrega el byte; si vale 0 hay framing error.
+6. **Vuelta a reposo.** El receptor regresa a `IDLE` en el centro del bit de stop, no al final. Así no pierde un start que llegue pegado a la trama anterior.
+
+El pulso `o_byte_valid` aparece unos 9,5 bits (≈ 2225 ciclos) después del flanco de start.
+
+#### Qué lo hace robusto
+
+| Mecanismo | Qué evita |
+| --- | --- |
+| Muestreo en el centro del bit | Que una pequeña diferencia de velocidad entre PC y FPGA corrompa los datos. Margen medido: de **−4,7 % a +5,6 %** |
+| Confirmación del start a medio bit | Que un pulso de ruido más corto que medio bit se interprete como un byte |
+| Verificación del bit de stop | Aceptar tramas mal formadas o desalineadas |
+| Descarte del byte con framing error | Entregar basura a la Debug Unit. Además `o_byte_data` no cambia |
+| Estado `WAIT_LINE_IDLE` | Que una línea atascada en 0 (*break*, cable desconectado) genere un framing error cada 10 bits. Se informa **un solo** error y el receptor retoma cuando la línea vuelve a 1 |
+| Reset síncrono | Abortar una recepción en curso sin dejar nada a medio entregar |
+
+> **Nota para el emisor.** Después de un framing error, el receptor necesita ver la línea en 1 al menos un instante antes de aceptar un nuevo start. Una trama normal siempre cumple esto, porque termina con su bit de stop en 1.
+
+### `uart_tx` — el transmisor
+
+#### Interfaz
+
+| Puerto | Dir. | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Clock del sistema |
+| `i_reset` | in | 1 | Reset síncrono. Corta cualquier envío y deja la línea en reposo |
+| `i_send_request` | in | 1 | Pulso de un ciclo: enviar `i_byte_data`. **Se ignora si `o_busy` vale 1** |
+| `i_byte_data` | in | 8 | Byte a enviar. Debe ser válido en el ciclo del pedido |
+| `o_tx_pin` | out | 1 | Pin de transmisión. En reposo vale 1 |
+| `o_busy` | out | 1 | Envío en curso |
+
+#### Cómo funciona
+
+Al aceptar un pedido, el transmisor arma la trama completa (`stop, D7…D0, start`) en un registro de 10 bits. El bit de la posición 0 es el que está en la línea. Cada 234 ciclos el registro se desplaza una posición y entra un 1 por la izquierda.
+
+Esto tiene dos consecuencias útiles:
+
+- **Después de diez desplazamientos el registro quedó lleno de unos**, así que la línea vuelve a reposo sin lógica adicional.
+- `o_tx_pin` sale directamente de un flip-flop, sin lógica combinacional en el medio, de modo que no puede tener glitches.
+
+#### Contrato de `o_busy`
+
+`o_busy` vale 1 durante **exactamente 2340 ciclos**: toda la trama, bit de stop incluido. Esto garantiza que el stop dure su tiempo completo aun cuando el siguiente byte se pida en cuanto `o_busy` baja.
+
+| Ciclo | Debug Unit | `uart_tx` |
+| --- | --- | --- |
+| N | `o_busy` es 0: pone `i_byte_data` e `i_send_request` = 1 | — |
+| N+1 | Pone `i_send_request` = 0 | Acepta el pedido y sube `o_busy`; el start sale a la línea |
+| N+2 | Ya puede consultar `o_busy` (vale 1) | Transmitiendo |
+| … | Espera | La trama dura 2340 ciclos |
+
+Dos reglas para quien use el módulo:
+
+- **`i_send_request` debe ser un pulso de un ciclo.** Si se mantiene en 1 hasta que `o_busy` baja, se enviaría el byte dos veces.
+- **No consultar `o_busy` en el ciclo N+1:** todavía vale 0 porque el pedido recién se está aceptando.
+
+Pidiendo cada byte en cuanto `o_busy` baja, entre una trama y la siguiente quedan 2 ciclos de reposo (una trama cada 2342 ciclos).
+
+### Buffers y casos límite
+
+**Decisión: no hay buffers.** Ni FIFO de recepción ni de transmisión.
+
+El motivo es que no pueden hacer falta. El protocolo es estrictamente pregunta-respuesta (la PC espera la respuesta antes de enviar el siguiente comando) y la Debug Unit toma cada byte en el mismo ciclo del pulso `o_byte_valid`. Entre dos bytes consecutivos pasan unos 2340 ciclos (más de 2200 aun con un emisor un 4 % más rápido). Por eso un byte nunca puede pisar a otro que todavía no se consumió.
+
+| Situación | Qué ocurre | Quién lo resuelve |
+| --- | --- | --- |
+| Llegan bytes más rápido de lo que se consumen | No puede suceder: se consumen en 1 ciclo y llegan separados por más de 2200 ciclos | `uart_rx` |
+| Stop bit en 0 | Se descarta el byte, se emite `o_framing_error` y se espera la línea en reposo | `uart_rx` |
+| Línea fija en 0 (break, cable suelto) | Un solo framing error; retoma cuando la línea vuelve a 1 | `uart_rx` |
+| Pulso de ruido menor a medio bit | Se ignora, sin error | `uart_rx` |
+| Reset en medio de una recepción | Se aborta; no se entrega nada | `uart_rx` |
+| Se enciende o resetea con tráfico en curso | Puede entregar un byte espurio; se resincroniza sola en el primer instante con la línea en reposo | `uart_rx` + protocolo |
+| Byte que la Debug Unit no espera (comando desconocido, bytes sobrantes) | La UART lo entrega igual; la Debug Unit decide (`ERR_CMD`, descarte por silencio de 100 ms) | `debug_unit` |
+| `i_send_request` con `o_busy` = 1 | Se ignora; la trama en curso no se altera. El byte pedido se pierde | `uart_tx` |
+| Reset en medio de un envío | La línea vuelve a 1 de inmediato y `o_busy` baja | `uart_tx` |
+
+**Sobre el criterio «los errores no dejan el protocolo bloqueado»:** todos los caminos de error del receptor terminan en `IDLE`. La única condición en la que espera sin avanzar es una línea fija en 0, que es una falla física y no puede resolverse desde la lógica; aun así el receptor no genera errores repetidos y retoma solo cuando la línea se libera. En el nivel de protocolo, los timeouts de 100 ms de la Debug Unit y la espera de 150 ms del cliente cubren la resincronización de mensajes.
+
+### Integración con la Debug Unit
+
+#### Correspondencia con los nombres de la arquitectura
+
+La arquitectura (documento 04, §8.1 y §11.2) usa nombres sin prefijo. En el RTL se aplicó la convención `i_` / `o_`:
+
+| Arquitectura | RTL |
+| --- | --- |
+| `rx_data` | `uart_rx.o_byte_data` |
+| `rx_valid` | `uart_rx.o_byte_valid` |
+| `rx_ferr` | `uart_rx.o_framing_error` |
+| `tx_data` | `uart_tx.i_byte_data` |
+| `tx_start` | `uart_tx.i_send_request` |
+| `tx_busy` | `uart_tx.o_busy` |
+
+#### Instanciación en `soc_top`
+
+```verilog
+uart_rx #(.CLK_HZ(27_000_000), .BAUD_RATE(115_200)) uart_receiver (
+    .i_clk           (clk),
+    .i_reset         (sys_rst),
+    .i_rx_pin        (uart_rx_pin),
+    .o_byte_data     (rx_data),
+    .o_byte_valid    (rx_valid),
+    .o_framing_error (rx_ferr)
+);
+
+uart_tx #(.CLK_HZ(27_000_000), .BAUD_RATE(115_200)) uart_transmitter (
+    .i_clk          (clk),
+    .i_reset        (sys_rst),
+    .i_send_request (tx_start),
+    .i_byte_data    (tx_data),
+    .o_tx_pin       (uart_tx_pin),
+    .o_busy         (tx_busy)
+);
+```
+
+La UART no depende de `cpu_en`: sigue operativa con el CPU pausado, como exige el modo paso a paso.
+
+#### Qué debe hacer la Debug Unit
+
+- Tomar `o_byte_data` en el ciclo en que `o_byte_valid` vale 1.
+- Ante `o_framing_error`, abortar el mensaje en curso y responder `ERR_FRAMING` (arquitectura §8.1).
+- Pedir cada byte de respuesta solo con `o_busy` en 0 y respetar el contrato de la sección 5.3.
+
+### Verificación
+
+Los tres testbenches son autoverificables: terminan con `PASS` o `FAIL`. Se simularon con Icarus Verilog 12.0 y están escritos en Verilog-2001 estándar, por lo que también corren en el simulador de Gowin o de Vivado.
+
+| Testbench | Qué comprueba | Resultado |
+| --- | --- | --- |
+| `tb_uart_tx` | La línea coincide con la trama esperada **ciclo a ciclo** durante los 2340 ciclos (start, datos del menos al más significativo, stop); `o_busy` en 1 durante toda la trama y en 0 al terminar; reposo tras el reset; bytes representativos y 8 consecutivos; pedidos con el transmisor ocupado (justo tras aceptar, a mitad de trama y en el último ciclo) sin alterar la trama; reset a mitad de trama | PASS (80 548 comparaciones) |
+| `tb_uart_rx` | Línea en reposo sin falsos bytes; 7 bytes representativos; 20 tramas pegadas sin reposo; los 256 valores seguidos; emisor ±2 % y ±4 % de velocidad; framing error y recuperación; break prolongado con un único error; glitches cortos; reset durante la recepción; pulsos de un solo ciclo; `o_byte_data` sin cambios ante una trama descartada | PASS (351 bytes comparados, 29 verificaciones) |
+| `tb_uart_loopback` | `uart_tx` conectado a `uart_rx`, 512 bytes a máxima velocidad (el siguiente en cuanto `o_busy` baja), todos en orden y sin framing errors. Repetido con relojes de 50 y 100 MHz para comprobar el cálculo del divisor | PASS a 27, 50 y 100 MHz |
+
+En `tb_uart_rx` el emisor cambia la línea en instantes sin relación de fase con el clock, y para las pruebas de tolerancia usa períodos que no son múltiplos exactos del ciclo, de modo que el receptor ve la señal con distintas fases.
+
+#### Ejecución
+
+```bash
+iverilog -g2005 -o tb_uart_tx.vvp uart_tx.v tb_uart_tx.v && vvp tb_uart_tx.vvp
+iverilog -g2005 -o tb_uart_rx.vvp uart_rx.v tb_uart_rx.v && vvp tb_uart_rx.vvp
+iverilog -g2005 -o tb_uart_lb.vvp uart_tx.v uart_rx.v tb_uart_loopback.v && vvp tb_uart_lb.vvp
+
+# Loopback con otro clock
+iverilog -g2005 -P tb_uart_loopback.CLK_HZ=50000000 -o tb_uart_lb50.vvp uart_tx.v uart_rx.v tb_uart_loopback.v
+```
+
+#### Inyección de fallas
+
+Para comprobar que las pruebas realmente detectan errores, se introdujeron 14 fallas, de a una, en copias del RTL. **Todas hicieron fallar al menos un testbench.**
+
+| Módulo | Falla inyectada |
+| --- | --- |
+| `uart_rx` | Bits recibidos del más al menos significativo |
+| `uart_rx` | No se verifica el bit de stop |
+| `uart_rx` | Sin espera de línea en reposo tras un framing error |
+| `uart_rx` | Sin confirmación del start a medio bit (no filtra glitches) |
+| `uart_rx` | `o_byte_valid` no vuelve a 0 (pulso de más de un ciclo) |
+| `uart_rx` | Período de bit un 13 % más corto |
+| `uart_rx` | El reset no aborta la recepción en curso |
+| `uart_rx` | Una trama con framing error igualmente se entrega |
+| `uart_tx` | Bit de stop en 0 |
+| `uart_tx` | Datos enviados del más al menos significativo |
+| `uart_tx` | Acepta pedidos con `o_busy` = 1 |
+| `uart_tx` | Período de bit un ciclo más corto |
+| `uart_tx` | El reset no devuelve la línea a reposo |
+| `uart_tx` | `o_busy` baja un bit antes (corta el stop) |
+
+#### Alcance de la verificación
+
+La simulación funcional **no** demuestra el comportamiento del sincronizador ante metaestabilidad ni el timing real en la FPGA. Esos puntos se evalúan en E7 con los reportes de Gowin EDA.
+
+### Costo, limitaciones y pendientes
+
+- **Recursos:** unos 34 flip-flops en `uart_rx` y 23 en `uart_tx` (conteo de registros; la cifra definitiva la da el reporte de Gowin EDA). La lógica más larga es un contador de 8 bits con una comparación de igualdad, por lo que no se espera que sea candidata a camino crítico. Se confirma en E7.
+- **Pulsos de ruido largos:** un glitch de más de medio bit se toma como un start; produce un byte espurio o un framing error. No hay filtrado dentro de un bit. Ante esto actúan los timeouts del protocolo.
+- **Un solo muestreo por bit:** no hay sobremuestreo ni voto por mayoría. Es suficiente para un enlace USB-UART corto y lo avalan los márgenes medidos.
+- **Pines:** la asignación de `uart_rx_pin` y `uart_tx_pin` sigue pendiente de confirmar con el esquemático de la Tang Nano 20K (arquitectura §14, punto 6).
+- **Cambio de clock:** si en E7 se usa un `rPLL`, basta con actualizar `CLK_HZ` en ambas instancias.
+- **Documento de arquitectura:** conviene sumar a §8.1 el comportamiento ante un framing error (espera de línea en reposo) y la regla de pedidos ignorados con `o_busy` = 1. Ver los ADR asociados.
