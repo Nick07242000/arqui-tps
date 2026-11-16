@@ -58,6 +58,8 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
 ├── uart_rx                  # bytes <- pin
 ├── uart_tx                  # bytes -> pin
 ├── debug_unit               # parser + FSM de sistema + secuenciador de respuestas
+├── program_loader           # recepción y escritura de programa en imem (colabora con debug_unit)
+├── execution_controller     # control de RUN/STEP/RESET, cpu_en y parte RESET de cpu_rst (colabora con debug_unit)
 ├── program_memory           # 1024x32, escritura DU / lectura CPU
 ├── data_memory              # 4 bancos de byte 1024x8, puerto A CPU, puerto B debug
 └── cpu_core
@@ -551,7 +553,7 @@ flowchart TD
 ### 7.1 Clock-enable único
 
 ```text
-cpu_en = (state == RUNNING) | step_pulse        // step_pulse = 1 ciclo de clk
+cpu_en = (state == RUNNING) | step_pulse        // generado por execution_controller (step_pulse = 1 ciclo de clk)
 ```
 
 - Todos los FF del CPU (PC, latches, banco de registros, contadores) y las BRAM (`ce`, `we`) se condicionan con `cpu_en`. El **clock físico nunca se detiene ni se deriva**; `cpu_en` solo habilita el avance.
@@ -830,8 +832,8 @@ cycle 12   pc=0x00000014   state=PAUSED
 
 | Señal | Productor → Consumidor | Ancho | Significado |
 | --- | --- | --- | --- |
-| `cpu_rst` | `debug_unit` → `cpu_core` | 1 | Reset síncrono del CPU (prioridad sobre `cpu_en`) |
-| `cpu_en` | `debug_unit` → `cpu_core`, memorias | 1 | Habilita el avance de un ciclo |
+| `cpu_rst` | `execution_controller` (RESET) / `program_loader` (LOAD) → `cpu_core` | 1 | Reset síncrono del CPU (prioridad sobre `cpu_en`) |
+| `cpu_en` | `execution_controller` → `cpu_core`, memorias | 1 | Habilita el avance de un ciclo |
 | `n_words` | `debug_unit` → `cpu_core` | 11 | Longitud de la imagen cargada (0..1024) |
 | `o_done` | `cpu_core` → `debug_unit` | 1 | `fetch_stop && pipeline_vacío` |
 | `o_done_reason` | `cpu_core` → `debug_unit` | 2 | 1 = HALT, 2 = END_OF_IMAGE |

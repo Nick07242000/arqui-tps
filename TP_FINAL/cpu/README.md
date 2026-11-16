@@ -2104,7 +2104,7 @@ Estimación con Yosys (`synth_gowin`) para el loader con sus parámetros por def
 | `tb_program_loader.v` | Testbench unitario |
 | `tb_program_reload.v` | Testbench de integración (carga A → B) |
 
-## HALT custom y vaciado final (US-4.3)
+## HALT custom y vaciado final
 
 ### ¿Qué problema resuelve?
 
@@ -2290,3 +2290,314 @@ Las palabras máquina de todos los programas de prueba se cotejaron con un desen
 | `tb_halt_and_drain.v` | Nuevo |
 | `hazard_unit.v` | Modificado (entrada `i_halt_commit`, flush ampliado) |
 | `cpu_core.v` | Modificado (puertos, `if_is_valid`, enable del PC, instancia nueva) |
+
+## Paso a paso sin intervenir el clock
+
+> **En una frase:** el reloj de la FPGA nunca se detiene ni se modifica. Para ejecutar "un ciclo por
+> comando", el CPU recibe un **permiso de avance** (`cpu_enable`) que vale 1 solo durante el ciclo
+> que se quiere ejecutar. El módulo nuevo `execution_controller` genera ese permiso y lleva el estado
+> del sistema (`EMPTY`, `READY`, `RUNNING`, `PAUSED`, `DONE`).
+
+### Qué problema resuelve
+
+La consigna pide dos modos de operación:
+
+- **Continuo:** un comando inicia la ejecución y el procesador corre hasta el final.
+- **Paso a paso:** cada comando ejecuta **exactamente un ciclo de clock** y luego se muestra el estado.
+
+Y al mismo tiempo prohíbe intervenir el clock: no se puede frenarlo, apagarlo ni derivar otro reloj
+para "simular" un paso. La solución es separar dos ideas que a veces se confunden:
+
+| Idea | Qué es | Qué hace este proyecto |
+| --- | --- | --- |
+| **El reloj** | La señal que late siempre (27 MHz en la Tang Nano 20K) | Llega sin modificar a todos los módulos |
+| **El permiso de avance** | Una señal de datos que dice "en este latido, avanzá" | Es `cpu_enable`; lo controla la Debug Unit |
+
+Es como un metrónomo que suena siempre: el músico (el CPU) decide en qué pulsos toca una nota y en
+cuáles se queda quieto. Modo continuo = toca en todos los pulsos. Paso a paso = toca en uno solo
+cuando se lo piden.
+
+### Qué se agregó
+
+| Archivo | Rol |
+| --- | --- |
+| `execution_controller.v` | **Módulo nuevo.** Estado del sistema + generación de `cpu_enable` y del reset del comando `RESET` |
+| `execution_defs.vh` | Códigos de estado y de resultado de las órdenes (mismo estilo que `program_loader_defs.vh`) |
+| `tb_execution_controller.v` | Testbench de integración: loader + controlador + CPU + memorias |
+
+**`cpu_core` no cambió.** Desde la US-3.x ya recibía `i_cpu_en` y todos sus elementos lo respetan.
+La US-4.4 completa la otra mitad: *quién* genera esa señal y con qué reglas.
+
+```mermaid
+flowchart LR
+  DU["Parser de la Debug Unit<br/>(E5)"] -->|"run, step, reset"| EC["execution_controller"]
+  LD["program_loader"] -->|"load_finished, error, program_valid"| EC
+  CPU["cpu_core + memorias"] -->|"done"| EC
+  EC -->|"cpu_enable"| CPU
+  EC -->|"cpu_reset"| RST(("OR de resets"))
+  LD -->|"cpu_reset"| RST
+  SYS["sys_rst"] --> RST
+  RST --> CPU
+  CLK["clk 27 MHz<br/>sin modificar"] --> EC
+  CLK --> CPU
+  CLK --> LD
+```
+
+#### Quién respeta `cpu_enable`
+
+| Elemento del CPU | Con `cpu_enable = 0` |
+| --- | --- |
+| `PC` | Retiene su valor |
+| Latches `IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB` | Retienen su contenido (incluso una burbuja pendiente no se inserta) |
+| Banco de registros | No escribe |
+| `halt_controller` | `halting` no cambia aunque haya un `HALT` en EX |
+| Memoria de programa (lectura) | No lee: `IF/ID.instr` queda congelada |
+| Memoria de datos (puerto A) | No lee y la escritura por byte queda en 0: un store en MEM espera |
+| **Debug Unit, UART, `execution_controller`, puerto B de `data_memory`, lectura de registros** | **No dependen de `cpu_enable`**: siguen operativos con el CPU pausado |
+
+### `execution_controller`
+
+#### Interfaz
+
+| Señal | Dir | Ancho | Descripción |
+| --- | --- | --- | --- |
+| `i_clk` | in | 1 | Clock del sistema, sin modificar |
+| `i_reset` | in | 1 | Reset de sistema (`sys_rst`): vuelve a `EMPTY` |
+| `i_run_request` | in | 1 | Pulso de 1 ciclo: orden `RUN` |
+| `i_step_request` | in | 1 | Pulso de 1 ciclo: orden `STEP` |
+| `i_reset_request` | in | 1 | Pulso de 1 ciclo: orden `RESET` |
+| `i_load_finished` | in | 1 | Pulso de `program_loader`: terminó una carga (bien o mal) |
+| `i_load_error_code` | in | 2 | Resultado de la carga (`program_loader_defs.vh`) |
+| `i_program_valid` | in | 1 | Hay una imagen completa y validada |
+| `i_cpu_done` | in | 1 | `o_done` del CPU: fin de búsqueda y pipeline vacío |
+| `o_cpu_enable` | out | 1 | **Permiso de avance** para el CPU y sus memorias |
+| `o_cpu_reset` | out | 1 | Pulso de reset síncrono del comando `RESET` |
+| `o_system_state` | out | 3 | Estado del sistema (campo `state` de `GET_STATUS`) |
+| `o_command_finished` | out | 1 | Pulso: `RUN`, `STEP` o `RESET` terminaron |
+| `o_command_result` | out | 2 | Resultado, válido junto con `o_command_finished` |
+
+**Contrato con la Debug Unit:** emite una orden, espera `o_command_finished` y recién entonces emite
+la siguiente. Si llegara una orden con otra en curso, se ignora (así una orden duplicada no puede
+pisar el resultado de un `STEP`).
+
+#### Estados
+
+| Código | Estado | Significado |
+| --- | --- | --- |
+| 0 | `EMPTY` | Sin programa válido |
+| 1 | `READY` | Programa cargado, CPU recién reseteado, sin ejecutar |
+| 2 | `RUNNING` | Ejecución continua en curso |
+| 3 | `PAUSED` | Se ejecutó al menos un paso y todavía no terminó |
+| 4 | `DONE` | Terminó (por `HALT` o fin de imagen) |
+
+El estado `LOADING` (5) es interno de la Debug Unit y este módulo no lo maneja.
+
+```mermaid
+stateDiagram-v2
+  [*] --> EMPTY: sys_rst
+  EMPTY --> READY: carga completa
+  READY --> RUNNING: RUN
+  READY --> PAUSED: STEP
+  PAUSED --> PAUSED: STEP sin done
+  PAUSED --> RUNNING: RUN
+  PAUSED --> DONE: STEP con done
+  RUNNING --> DONE: done
+  RUNNING --> READY: RESET abort
+  PAUSED --> READY: RESET o carga
+  DONE --> READY: RESET o carga
+  READY --> READY: RESET o carga
+  READY --> EMPTY: carga interrumpida
+  PAUSED --> EMPTY: carga interrumpida
+  DONE --> EMPTY: carga interrumpida
+```
+
+#### Qué responde a cada orden
+
+| Orden | `EMPTY` | `READY` | `RUNNING` | `PAUSED` | `DONE` |
+| --- | --- | --- | --- | --- | --- |
+| `RUN` | `NO_PROGRAM` | OK → `RUNNING` | `BUSY` | OK → `RUNNING` | `WRONG_STATE` |
+| `STEP` | `NO_PROGRAM` | OK (1 ciclo) → `PAUSED` o `DONE` | `BUSY` | OK (1 ciclo) → `PAUSED` o `DONE` | `WRONG_STATE` |
+| `RESET` | OK → `EMPTY` | OK → `READY` | OK (**aborta**) → `READY` | OK → `READY` | OK → `READY` |
+
+Un rechazo nunca cambia el estado ni habilita al CPU. Los códigos de resultado se traducen en E5 a los
+`STATUS` del protocolo:
+
+| `o_command_result` | `STATUS` UART |
+| --- | --- |
+| `EXEC_RESULT_OK` | `0x00 OK` |
+| `EXEC_RESULT_WRONG_STATE` | `0x04 ERR_STATE` |
+| `EXEC_RESULT_BUSY` | `0x05 ERR_BUSY` |
+| `EXEC_RESULT_NO_PROGRAM` | `0x06 ERR_NO_PROGRAM` |
+
+#### Anatomía de un `STEP`
+
+El controlador no pasa la orden directamente al CPU: genera un **pulso registrado de un ciclo**
+(`step_pulse`) y recién cuando el CPU ya avanzó lee `done` para decidir el estado final.
+
+| Ciclo | Qué ocurre | `cpu_enable` |
+| --- | --- | --- |
+| `t` | La Debug Unit emite `i_step_request`. El controlador la acepta al cierre del ciclo. | 0 |
+| `t+1` | `step_pulse = 1`. **Este es el único ciclo habilitado**: al cierre, el pipeline avanza una vez. | **1** |
+| `t+2` | El CPU ya avanzó, así que `i_cpu_done` describe el estado *posterior* al paso. Se decide `PAUSED` o `DONE`. | 0 |
+| `t+3` | `o_command_finished = 1`. La Debug Unit arma la respuesta y las consultas devuelven una foto consistente. | 0 |
+
+Latencias medidas en simulación: `RUN` responde en **1 ciclo**, `RESET` en **2** y `STEP` en **3**
+(≈ 111 ns a 27 MHz; irrelevante frente a los 86,8 µs que tarda un solo byte por UART).
+
+#### `RUN`, fin de ejecución y el ciclo extra
+
+`RUN` es no bloqueante: responde `OK` enseguida y el sistema queda en `RUNNING` con
+`cpu_enable = 1` de forma continua. Cuando el CPU activa `done`, el controlador pasa a `DONE` y
+`cpu_enable` se apaga.
+
+Detectar `done` lleva un ciclo, así que **en modo continuo se habilita un ciclo de más** al final.
+Es inofensivo: con `done = 1` el CPU es idempotente (PC retenido, pipeline vacío, nada que escribir).
+La simulación lo comprueba: para el programa de prueba, el modo continuo gasta 16 ciclos habilitados
+y el paso a paso llega a `DONE` en 15; el estado tras el ciclo 16 es idéntico al del 15.
+
+#### `RESET` y abort
+
+`RESET` se acepta siempre. Estando en `RUNNING` funciona como **abort**: el estado pasa a `READY`
+en el mismo instante en que se acepta la orden (así `cpu_enable` se apaga de inmediato) y el pulso de
+reset se aplica un ciclo después. De esa forma `cpu_enable` y `cpu_reset` **nunca coinciden**.
+El PC vuelve a 0, `x1–x31` a 0 y el pipeline queda vacío; la memoria de datos y la de programa se
+conservan, tal como define la política de reset.
+
+#### Cómo reacciona a una carga
+
+La carga la ejecuta `program_loader`; el controlador solo observa su resultado:
+
+| Resultado de la carga | Estado |
+| --- | --- |
+| Completa y válida | `READY` |
+| Rechazada (encabezado inválido) con el programa anterior intacto | **No cambia** |
+| Interrumpida después de un encabezado válido (el programa anterior ya se perdió) | `EMPTY` |
+
+Si la carga ocurre estando `PAUSED`, el CPU queda detenido y el reset que aplica el loader lo deja
+en estado inicial: la carga con el CPU pausado funciona sin ningún trato especial.
+
+### Stall y flush con paso a paso
+
+**Regla:** un `STEP` es **un ciclo de clock del pipeline, haya o no stall o flush**. El permiso de
+avance es independiente de los riesgos: `cpu_enable` decide *si* el pipeline avanza este ciclo y
+`hazard_unit` decide *cómo* lo hace.
+
+Traza real del programa de prueba (11 palabras; `I0`…`I10`), un paso por fila. Cada columna muestra
+qué instrucción queda en cada etapa **después** del paso; `—` es una etapa vacía o una burbuja.
+
+| Paso | IF/ID | ID/EX | EX/MEM | MEM/WB | PC | Qué ocurrió en ese ciclo |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | I0 | — | — | — | 0x04 | Se busca `addi x1,x0,5` |
+| 2 | I1 | I0 | — | — | 0x08 | |
+| 3 | I2 | I1 | I0 | — | 0x0C | |
+| 4 | I3 | I2 | I1 | I0 | 0x10 | Pipeline lleno |
+| 5 | I4 | I3 | I2 | I1 | 0x14 | `lw` pasa a ID/EX; `add` (usa `x3`) queda en ID |
+| 6 | I4 | **—** | I3 | I2 | 0x14 | **Stall load-use:** PC e IF/ID congelados, burbuja en ID/EX |
+| 7 | I5 | I4 | **—** | I3 | 0x18 | La burbuja avanza |
+| 8 | I6 | I5 | I4 | — | 0x1C | `beq` llega a EX |
+| 9 | **—** | **—** | I5 | I4 | 0x20 | **Flush:** branch tomado, I6 e I7 anuladas, PC = destino |
+| 10 | I8 | — | — | I5 | 0x24 | |
+| 11 | I9 | I8 | — | — | 0x28 | |
+| 12 | I10 | I9 | I8 | — | 0x2C | Se busca `I10`, posterior a `HALT` |
+| 13 | **—** | **—** | I9 | I8 | 0x2C | **Flush por HALT:** `I10` se anula, `halting = 1` |
+| 14 | — | — | — | I9 | 0x2C | |
+| 15 | — | — | — | — | 0x2C | Pipeline vacío: `DONE` |
+
+Dos detalles que el testbench verifica explícitamente:
+
+- El paso 6 (stall) **consume un paso completo** aunque el PC no se mueva.
+- Con `HALT` ya en EX y el CPU pausado, `halting` sigue en 0 hasta el `STEP` siguiente: lo que se
+  consulta en pausa es siempre el resultado de un número entero de ciclos.
+
+> **Nota sobre los registros en `PAUSED`:** la escritura de la instrucción visible en `MEM/WB` se
+> aplica en el flanco del *siguiente* `STEP`. Por eso el banco de registros consultado en pausa muestra
+> el estado previo a ese write-back.
+
+### Garantía de que el clock no se interviene
+
+La revisión se hizo mecánicamente sobre todo el RTL (22 módulos):
+
+| Comprobación | Resultado |
+| --- | --- |
+| Bloques secuenciales (`always @(posedge …)`) | 11, **todos** con `posedge i_clk` |
+| Eventos de flanco con otra señal (`negedge`, `posedge` de algo que no sea `i_clk`) | **Ninguno** |
+| `assign` que genere o derive un reloj | **Ninguno** |
+| Instancias que reciben `i_clk` | Todas, directo, sin lógica intermedia |
+| `cpu_enable` en el RTL | Solo entra como habilitación de datos (`CE`) de flip-flops y memorias |
+
+Además, el testbench tiene un **monitor permanente**: si `cpu_enable` se activa en un ciclo que no
+corresponde a un `STEP` en curso ni a `RUNNING`, la prueba falla. También verifica que ninguna
+escritura de la memoria de datos ocurra con el CPU pausado.
+
+### Verificación
+
+El testbench integra `program_loader` + `execution_controller` + `cpu_core` + `program_memory` +
+`data_memory`, y emula la Debug Unit desde el propio testbench. Los programas se arman con un
+mini-ensamblador local de seis funciones.
+
+| Prueba | Qué demuestra | Tarea |
+| --- | --- | --- |
+| Sin programa | `RUN`/`STEP` se rechazan con `NO_PROGRAM` y el CPU nunca avanza | T4.4.4 |
+| Carga completa | El sistema queda en `READY`, con PC en 0 y pipeline vacío | T4.4.1 |
+| Pausa | 50 ciclos sin órdenes no cambian ningún bit del CPU | T4.4.1 |
+| Un `STEP` = un ciclo | `cpu_enable` vale 1 exactamente un ciclo y el pipeline avanza una vez | T4.4.4 |
+| **Paso a paso ≡ continuo** | Estado idéntico ciclo a ciclo, incluyendo un stall, un branch tomado y un `HALT` | T4.4.3 / T4.4.4 |
+| `STEP`/`RUN` en `DONE` | Se rechazan con `WRONG_STATE` | T4.4.4 |
+| Pasos y luego `RUN` | Continúa sin perder ni duplicar ciclos ni stores | T4.4.4 |
+| `HALT` en EX en pausa | `halting` solo cambia con el siguiente `STEP` | T4.4.3 |
+| Sin `HALT` | Termina por `END_OF_IMAGE` en N + 4 pasos | T4.4.4 |
+| `RESET` en `RUNNING` | Aborta, rechaza `STEP`/`RUN` con `BUSY` antes de abortar y el CPU queda detenido | T4.4.1 |
+| Control con CPU pausado | Tras 2000 ciclos de pausa, `STEP`, `RESET` y una carga nueva siguen funcionando | T4.4.5 |
+| Resultado de la carga | Rechazo → estado intacto; carga truncada → `EMPTY` | T4.4.1 |
+
+**Resultado:** `PASS: 217 verificaciones`.
+
+**Inyección de fallas.** Para confirmar que las pruebas no pasan "en vacío", se introdujeron 15 fallas
+una por una y todas fueron detectadas:
+
+| Dónde | Fallas inyectadas |
+| --- | --- |
+| `execution_controller` (10) | `STEP` dura 2 ciclos · el enable se filtra en `PAUSED` · `done` leído antes del ciclo · `RESET` no aborta · `RUN` aceptado en `DONE` · carga rechazada manda a `EMPTY` · `RUNNING` nunca llega a `DONE` · `RESET` sin pulso de reset · `STEP` aceptado en `RUNNING` · `STEP` siempre termina en `PAUSED` |
+| `cpu_core` y módulos (5) | `MEM/WB` ignora el enable · el banco de registros escribe pausado · `halting` ignora el enable · el store ignora el enable · el PC avanza pausado |
+
+**Síntesis (Yosys, `synth_gowin`):** `execution_controller` ocupa 9 flip-flops y ≈ 42 LUT, sin latches
+inferidos. Es despreciable frente al resto del diseño (el banco de registros solo ya usa ≈ 4 900 LUT4).
+Valores a confirmar con Gowin EDA en la etapa E7.
+
+#### Cómo reproducir
+
+```bash
+iverilog -g2012 -y . -I . -o tb_execution_controller.vvp tb_execution_controller.v
+vvp tb_execution_controller.vvp        # esperado: PASS: 217 verificaciones
+```
+
+### Cómo lo usará la Debug Unit
+
+| Comando UART | Qué hace la Debug Unit |
+| --- | --- |
+| `RUN`, `STEP`, `RESET` | Pulsa la entrada `i_*_request` correspondiente, espera `o_command_finished` y responde según `o_command_result`. Para `STEP` y `RUN` informa `o_system_state` en el payload |
+| `LOAD_PROGRAM` | Si `o_system_state == RUNNING` responde `ERR_BUSY`; si no, reenvía los bytes a `program_loader`. El controlador se entera del resultado por `i_load_finished` |
+| `GET_REGS`, `GET_PIPELINE`, `GET_MEMORY` | Si `o_system_state == RUNNING` responde `ERR_BUSY`; si no, lee con el CPU detenido |
+| `GET_STATUS` | Usa `o_system_state` (siempre disponible, también en `RUNNING`) |
+
+El top debe combinar los resets: `cpu_rst = sys_rst | o_cpu_reset (execution_controller) | o_cpu_reset (program_loader)`.
+
+### Decisiones y límites
+
+Las decisiones están registradas como ADR:
+
+1. `execution_controller` es un módulo separado de la Debug Unit.
+2. `STEP` usa un pulso registrado de un ciclo y lee `done` un ciclo después.
+3. `RESET` corta el enable antes de aplicar el reset.
+4. Las comparaciones de estado del testbench se hacen por `valid`.
+
+**Límites que conviene tener presentes**
+
+- **T4.4.5 con UART real queda para E5.** Todavía no existe `uart_rx`/`uart_tx`. Lo que sí se demuestra
+  es la condición necesaria: nada del lado de la Debug Unit (controlador, loader, puerto B, lectura de
+  registros) depende de `cpu_enable`. La prueba con bytes reales por el puerto serie se hace al integrar
+  la UART.
+- **`cpu_enable` es una compuerta OR de dos registros** que alimenta el *clock-enable* de unos mil
+  flip-flops y de las BRAM. Si en E7 su fanout limitara el timing, se puede replicar el registro.
+- **El testbench lee registros y latches por jerarquía** (`cpu.register_file.registers`, `cpu.if_id_valid`…).
+  Es un atajo de simulación: si se renombran esas instancias hay que actualizar el testbench.

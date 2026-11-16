@@ -754,3 +754,122 @@ El ADR "Selección del próximo PC sin módulo `pc_control`" dejaba abierto reev
 
 - `pc_control` sigue sin materializarse; el ADR anterior queda resuelto.
 - `halt_controller` expone `o_halt_commit`, que `cpu_core` entrega a `hazard_unit` para el flush, tal como anticipaba el ADR "Generación del flush en `hazard_unit`".
+
+## ADR - Módulo `execution_controller` separado de la Debug Unit
+
+### Contexto
+
+El documento de arquitectura (§7.1, §7.2) ubica en la Debug Unit la FSM de sistema (`EMPTY`, `READY`, `RUNNING`, `PAUSED`, `DONE`) y la generación de `cpu_en = (state == RUNNING) | step_pulse`. La US-4.4 se implementa antes que la UART y el parser (E5), pero el paso a paso y la ejecución continua ya se pueden verificar con el CPU real. Hay que decidir dónde vive esa lógica.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Implementarla dentro de la Debug Unit, junto con el parser de comandos. |
+| **A** | **Un módulo `execution_controller` que recibe las órdenes como pulsos y devuelve el estado y un código de resultado.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Se prueba completo con `cpu_core`, memorias y `program_loader` sin UART ni parser, respetando el orden del roadmap (E4 antes que E5).
+- Sigue el mismo criterio que `program_loader`: la Debug Unit queda como frontera con el protocolo y no conoce los detalles de la ejecución.
+- Los códigos de resultado (`OK`, `BUSY`, `NO_PROGRAM`, `WRONG_STATE`) se traducen a los `STATUS` del protocolo sin que el controlador conozca los bytes de la UART.
+- La lógica del estado del sistema y la del permiso de avance comparten el mismo registro de estado: separarlas en dos módulos obligaría a duplicarlo.
+
+### Consecuencias
+
+- La Debug Unit debe esperar `o_command_finished` antes de emitir otra orden; el controlador ignora una orden que llegue con otra en curso.
+- La decisión de responder `ERR_BUSY` a `LOAD_PROGRAM` y a las consultas `GET_*` durante `RUNNING` sigue siendo de la Debug Unit, a partir de `o_system_state`.
+- El controlador aplica la regla de estado tras una carga: completa → `READY`; rechazada con el programa anterior intacto → el estado no cambia; interrumpida después de un encabezado válido → `EMPTY`.
+- `execution_controller` no figura en la tabla de módulos del documento de arquitectura (§1.1) y conviene agregarlo.
+- El top debe combinar los resets: `cpu_rst = sys_rst | o_cpu_reset (execution_controller) | o_cpu_reset (program_loader)`.
+
+## ADR - `STEP`: pulso registrado de un ciclo y `done` leído un ciclo después
+
+### Contexto
+
+Un `STEP` debe habilitar al CPU durante exactamente un ciclo y responder con el estado posterior a ese ciclo, sin tocar el clock. Hay que decidir cómo se genera el permiso de avance y cuándo se lee `done`.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | `cpu_enable` combinacional a partir de `i_step_request`. |
+| **A** | **Un pulso registrado (`step_pulse`) de un ciclo; el estado final se decide un ciclo después, cuando el CPU ya avanzó.** |
+| B | Igual que A, y además condicionar `cpu_enable` con `!done`. |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Con un pulso registrado, el ancho del permiso no depende del ancho de la orden ni de glitches de la entrada: es siempre un ciclo.
+- `done` es combinacional sobre registros que cambian en el flanco del ciclo habilitado; leído en el ciclo siguiente describe el estado posterior al paso. Leerlo en el mismo ciclo del pulso devolvería el estado previo (la inyección de esa falla se detecta en el testbench).
+- La opción B agrega un camino `done → CE` de alto fanout. No hace falta: con `done = 1` el CPU es idempotente (ya lo establece el documento de arquitectura, §7.1).
+
+### Consecuencias
+
+- Latencia de respuesta medida: `RUN` 1 ciclo, `RESET` 2, `STEP` 3.
+- `o_system_state` no cambia hasta que el paso terminó, así que siempre es coherente con lo que el CPU muestra.
+- Un `STEP` consume un ciclo de reloj del pipeline aunque haya un stall o un flush: el permiso de avance es ortogonal a los riesgos.
+- En `RUNNING` se habilita un ciclo extra al detectar `done`. No tiene efectos por la idempotencia del CPU; el testbench lo verifica comparando el estado antes y después de ese ciclo.
+
+## ADR - `RESET` corta el enable antes de aplicar el reset
+
+### Contexto
+
+`RESET` aborta una ejecución en `RUNNING`. En ese momento `cpu_enable` vale 1 de forma continua, y el reset síncrono debe aplicarse sobre un CPU que no esté avanzando. `cpu_core` ya da prioridad al reset sobre el enable, pero conviene no depender de eso.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Mantener `RUNNING` hasta que termine el pulso de reset; durante un ciclo coinciden `cpu_enable` y `cpu_reset`. |
+| **A** | **Cambiar el estado a `READY` al aceptar la orden y aplicar el pulso de reset en el ciclo siguiente.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- `cpu_enable` y `cpu_reset` nunca coinciden: cada flip-flop y cada memoria tiene un único motivo para cambiar en un ciclo dado.
+- Permite una invariante simple y verificable por un monitor: `cpu_enable` solo vale 1 durante un `STEP` en curso o con el estado en `RUNNING`.
+
+### Consecuencias
+
+- Durante un ciclo `o_system_state` ya vale `READY` y el CPU todavía no se reseteó. No es observable: la Debug Unit responde recién con `o_command_finished`, dos ciclos después de aceptar la orden.
+- `RESET` en `EMPTY` mantiene `EMPTY`; en cualquier otro estado deja `READY`. El estado alcanza para saberlo: no hace falta consultar `i_program_valid`.
+
+## ADR - Las comparaciones de estado del testbench se hacen por `valid`
+
+### Contexto
+
+La prueba central de la US-4.4 compara, ciclo a ciclo, la ejecución paso a paso contra la continua. La primera versión de la comparación falló en los primeros pasos y en el ciclo extra de `RUN`, aunque el RTL era correcto: la "foto" incluía campos de etapas con `valid = 0`, como `ID/EX.instr`, que captura la salida vieja de la BRAM de `program_memory` y puede variar entre una ejecución y otra.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Comparar todos los campos de todos los latches. |
+| **A** | **Enmascarar en la foto los campos de cada etapa con su `valid`.** |
+| B | Limpiar esos campos en el RTL (la opción A del ADR «Contenido de una etapa invalidada»). |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Es coherente con el ADR «Contenido de una etapa invalidada: decide `valid`»: una etapa con `valid = 0` está vacía y el resto de sus campos son irrelevantes.
+- La opción B sumaría lógica combinacional al RTL solo para que una comparación de simulación resulte más cómoda.
+
+### Consecuencias
+
+- Sin cambios de RTL.
+- La foto lee los registros por jerarquía (`cpu.register_file.registers`) y las etapas con `cpu.if_id_valid` y similares. Es un atajo de simulación que depende de esos nombres, igual que la limpieza de `data_memory` en el ADR de convenciones de los testbenches de riesgos estructurales.
+- Los programas de prueba se arman con un mini-ensamblador local de seis funciones dentro del testbench. Pueden reemplazarse por `test_instruction_encoders.vh` sin cambiar las pruebas.
