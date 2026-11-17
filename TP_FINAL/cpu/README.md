@@ -2880,3 +2880,359 @@ La simulación funcional **no** demuestra el comportamiento del sincronizador an
 - **Pines:** la asignación de `uart_rx_pin` y `uart_tx_pin` sigue pendiente de confirmar con el esquemático de la Tang Nano 20K (arquitectura §14, punto 6).
 - **Cambio de clock:** si en E7 se usa un `rPLL`, basta con actualizar `CLK_HZ` en ambas instancias.
 - **Documento de arquitectura:** conviene sumar a §8.1 el comportamiento ante un framing error (espera de línea en reposo) y la regla de pedidos ignorados con `o_busy` = 1. Ver los ADR asociados.
+
+## Protocolo de comandos UART
+
+### Qué resuelve este bloque
+
+La UART (US-5.1) solo mueve bytes sueltos. Este bloque les da **significado**: decide cuándo un grupo de bytes es un comando completo y válido, lo ejecuta, y responde con un resultado inequívoco.
+
+Se compone de dos módulos y un archivo de constantes:
+
+| Archivo | Rol |
+| --- | --- |
+| `command_parser.v` | Recibe los bytes, arma el mensaje, lo valida y ordena la acción. |
+| `response_sender.v` | Convierte una respuesta en bytes y los entrega al transmisor UART. |
+| `protocol_defs.vh` | Códigos de comando, códigos de `STATUS` y largos de payload. |
+
+Ninguno de los dos toca el clock ni el estado del CPU: solo emiten **órdenes de un ciclo** hacia los módulos que ya existen (`execution_controller` y `program_loader`).
+
+```mermaid
+flowchart LR
+  PC["PC"] -->|"bytes"| URX["uart_rx"]
+  URX --> CP["command_parser"]
+  CP -->|"RUN / STEP / RESET"| EC["execution_controller"]
+  EC -->|"estado y resultado"| CP
+  CP -->|"bytes de LOAD_PROGRAM"| PL["program_loader"]
+  PL -->|"escribe"| PM["program_memory"]
+  PL -->|"resultado de la carga"| CP
+  CP -->|"pedido de respuesta"| RS["response_sender"]
+  RS -->|"bytes"| UTX["uart_tx"]
+  UTX --> PC
+  RS <-->|"payload por indice"| PP["proveedor de payload (US-5.3)"]
+```
+
+### El protocolo en una página
+
+Esta sección es todo lo que necesita saber quien escriba el cliente de PC. Es el entregable de la tarea T5.2.4.
+
+#### Formato de los mensajes
+
+Cada operación es un **pedido** de la PC seguido de **una respuesta** de la FPGA. Los enteros de más de un byte viajan en **little-endian** (primero el byte menos significativo).
+
+```text
+Pedido   (PC → FPGA):  [CMD : 1 byte][LEN : 2 bytes][PAYLOAD : LEN bytes]
+Respuesta (FPGA → PC): [STATUS : 1 byte][LEN : 2 bytes][PAYLOAD : LEN bytes]
+```
+
+Las reglas básicas:
+
+- Es estrictamente *pedido → respuesta*: el cliente **no envía el siguiente pedido hasta recibir la respuesta**. La FPGA nunca envía mensajes por su cuenta.
+- Si `STATUS` es distinto de `0x00` (error), la respuesta tiene `LEN = 0`: no lleva payload.
+- No hay checksum ni versionado; la integridad se apoya en los timeouts de la sección 4.
+- Línea serie: 115200 baudios, 8 bits, sin paridad, 1 bit de stop (8-N-1).
+
+#### Comandos
+
+| Código | Comando | `LEN` del pedido | Payload del pedido | Payload de la respuesta OK |
+| --- | --- | --- | --- | --- |
+| `0x01` | `LOAD_PROGRAM` | `2 + 4·N` | `N_WORDS:u16` y `N` palabras de 32 bits | `state:u8` |
+| `0x02` | `RESET` | 0 | — | `state:u8` |
+| `0x03` | `RUN` | 0 | — | `state:u8` |
+| `0x04` | `STEP` | 0 | — | `state:u8` |
+| `0x05` | `GET_STATUS` | 0 | — | 17 bytes |
+| `0x06` | `GET_REGS` | 0 | — | 128 bytes (`x0`…`x31`, cada uno `u32`) |
+| `0x07` | `GET_PIPELINE` | 0 | — | 73 bytes (los cuatro latches) |
+| `0x08` | `GET_MEMORY` | 4 | `start_word:u16`, `count:u16` | `4 · count` bytes (`count` palabras) |
+
+`state` es el estado del sistema una vez ejecutado el comando: `0` EMPTY, `1` READY, `2` RUNNING, `3` PAUSED, `4` DONE.
+
+#### Códigos de `STATUS`
+
+| Código | Nombre | Cuándo se produce |
+| --- | --- | --- |
+| `0x00` | `OK` | El comando se ejecutó. |
+| `0x01` | `ERR_CMD` | El código de comando no existe. |
+| `0x02` | `ERR_LEN` | `LEN` no es el que corresponde al comando, o supera el máximo (4098 bytes). |
+| `0x03` | `ERR_ARG` | Argumento fuera de rango (`N_WORDS` fuera de [1, 1024]; `count = 0`; `start + count > 1024`). |
+| `0x04` | `ERR_STATE` | El comando no es válido en el estado actual (p. ej. `RUN` con la ejecución terminada). |
+| `0x05` | `ERR_BUSY` | La CPU está en `RUNNING` y el comando exige que no lo esté. |
+| `0x06` | `ERR_NO_PROGRAM` | `RUN` o `STEP` sin un programa válido cargado. |
+| `0x07` | `ERR_TIMEOUT` | El mensaje quedó incompleto (llegaron menos bytes que los declarados). |
+| `0x08` | `ERR_FRAMING` | La UART detectó un error de framing mientras llegaba el mensaje. |
+| `0x09` | `ERR_INTERNAL` | El sistema no respondió como se esperaba (no debería ocurrir). |
+
+#### Qué comando se acepta en cada estado
+
+| Comando | `EMPTY` | `READY` | `RUNNING` | `PAUSED` | `DONE` |
+| --- | --- | --- | --- | --- | --- |
+| `LOAD_PROGRAM` | OK | OK | `ERR_BUSY` | OK | OK |
+| `RESET` | OK | OK | OK (aborta) | OK | OK |
+| `RUN` | `ERR_NO_PROGRAM` | OK | `ERR_BUSY` | OK | `ERR_STATE` |
+| `STEP` | `ERR_NO_PROGRAM` | OK | `ERR_BUSY` | OK | `ERR_STATE` |
+| `GET_STATUS` | OK | OK | **OK** | OK | OK |
+| `GET_REGS`, `GET_PIPELINE`, `GET_MEMORY` | OK | OK | `ERR_BUSY` | OK | OK |
+
+Un `LOAD_PROGRAM` que falla **no** destruye el programa anterior si el error está en el encabezado (`ERR_ARG`, `ERR_LEN`). Solo una carga que se interrumpe *después* de un encabezado válido deja el sistema en `EMPTY`.
+
+#### Orden de validación
+
+Cuando un mensaje tiene más de un problema se informa **el primero** de esta lista:
+
+1. `LEN` mayor que el máximo → `ERR_LEN`.
+2. Comando desconocido → `ERR_CMD`.
+3. `LEN` incompatible con el comando → `ERR_LEN`.
+4. Argumentos fuera de rango → `ERR_ARG`.
+5. Estado que no admite el comando → `ERR_BUSY`, `ERR_STATE` o `ERR_NO_PROGRAM`.
+
+La validación termina siempre **antes de modificar nada**: un mensaje rechazado no cambia el CPU, los registros, las memorias ni el estado del sistema.
+
+> `LOAD_PROGRAM` es la excepción en los puntos 3 y 4: el parser solo comprueba que el mensaje no supere el máximo. La coherencia entre `LEN` y `N_WORDS` y el rango de `N_WORDS` los valida el `program_loader`, que ya lo hacía desde la US-4.2.
+
+#### Ejemplos en hexadecimal
+
+**Ejecutar** (sistema en `READY`):
+
+```text
+PC → FPGA : 03 00 00                       RUN, sin payload
+FPGA → PC : 00 01 00 02                    OK, 1 byte de payload: state = 2 (RUNNING)
+```
+
+**Cargar un programa de 2 palabras** (`0x00000013` y el `HALT` `0x0000000B`):
+
+```text
+PC → FPGA : 01 0A 00  02 00  13 00 00 00  0B 00 00 00
+            │  │      │      └─ palabra 0   └─ palabra 1 (little-endian)
+            │  │      └─ N_WORDS = 2
+            │  └─ LEN = 2 + 4·2 = 10
+            └─ LOAD_PROGRAM
+FPGA → PC : 00 01 00 01                    OK, state = 1 (READY)
+```
+
+**Leer 3 palabras de la memoria de datos desde la palabra 2:**
+
+```text
+PC → FPGA : 08 04 00  02 00  03 00        GET_MEMORY, LEN = 4, start = 2, count = 3
+FPGA → PC : 00 0C 00  <12 bytes>          OK, LEN = 12 = 4 · 3
+```
+
+**Errores:**
+
+```text
+PC → FPGA : 03 00 00                       RUN con la ejecución ya terminada
+FPGA → PC : 04 00 00                       ERR_STATE, sin payload
+
+PC → FPGA : 7F 00 00                       comando inexistente
+FPGA → PC : 01 00 00                       ERR_CMD
+```
+
+#### Cuánto tarda
+
+A 115200 baudios un byte ocupa 86,8 µs. Los mensajes grandes no son instantáneos:
+
+| Operación | Bytes en el cable | Tiempo aproximado |
+| --- | --- | --- |
+| Respuesta de error o de `RUN`/`STEP`/`RESET` | 3 o 4 | menos de 0,4 ms |
+| `GET_STATUS` | 20 | 1,7 ms |
+| `GET_PIPELINE` | 76 | 6,6 ms |
+| `GET_REGS` | 131 | 11,4 ms |
+| `GET_MEMORY` de 1024 palabras / `LOAD_PROGRAM` de 1024 palabras | 4099 / 4101 | 0,36 s |
+
+### Cómo procesa un mensaje la FPGA
+
+1. **Espera el `CMD`.** Mientras no llega nada, el parser está en reposo (sin límite de espera).
+2. **Lee `LEN`.** Con los dos bytes de longitud ya conoce el mensaje y decide cómo seguir:
+   - si `LEN` supera el máximo, responde `ERR_LEN` de inmediato y pasa a ignorar bytes (sección 4);
+   - si es `LOAD_PROGRAM` y la CPU no está corriendo, **reenvía cada byte al `program_loader`** y espera su veredicto;
+   - en cualquier otro caso lee el payload (si lo hay).
+3. **Consume el mensaje completo** antes de validar y responder. Así un comando inválido nunca deja bytes sueltos que se confundan con un comando nuevo.
+4. **Valida** en el orden de la sección 2.5 y, si todo está bien, **ordena la acción**:
+   - `RUN`, `STEP`, `RESET`: pulso de un ciclo al `execution_controller` y espera de su resultado;
+   - `GET_*`: no hay acción, se responde directamente;
+   - `LOAD_PROGRAM`: ya lo resolvió el `program_loader`.
+5. **Pide la respuesta** al `response_sender` y espera a que termine de salir antes de aceptar otro comando.
+
+El resultado de cada orden se traduce a un `STATUS` así:
+
+| Lo que informa el sistema | `STATUS` |
+| --- | --- |
+| `EXEC_RESULT_OK` / `LOAD_ERROR_NONE` | `OK` |
+| `EXEC_RESULT_BUSY` | `ERR_BUSY` |
+| `EXEC_RESULT_NO_PROGRAM` | `ERR_NO_PROGRAM` |
+| `EXEC_RESULT_WRONG_STATE` | `ERR_STATE` |
+| `LOAD_ERROR_ARGUMENT` | `ERR_ARG` |
+| `LOAD_ERROR_LENGTH` | `ERR_LEN` |
+| `LOAD_ERROR_TIMEOUT` | `ERR_TIMEOUT` |
+
+### Cuando algo sale mal
+
+| Situación | Qué hace la FPGA | Qué ve el cliente |
+| --- | --- | --- |
+| Llegan menos bytes que los declarados (incluido un encabezado cortado) | Tras 100 ms sin recibir nada, aborta el mensaje. | `ERR_TIMEOUT` |
+| `LOAD_PROGRAM` interrumpido a mitad | El `program_loader` espera 100 ms y falla. Si el encabezado ya era válido, el sistema queda en `EMPTY`. | `ERR_TIMEOUT` |
+| Error de framing de la UART | Aborta el mensaje y **descarta todo hasta 100 ms de silencio**. | `ERR_FRAMING` |
+| `LEN` mayor que 4098 | Responde enseguida y **descarta todo hasta 100 ms de silencio**. | `ERR_LEN` |
+| `LEN` incompatible con el comando, pero dentro del máximo | Lee los `LEN` bytes completos y responde. | `ERR_LEN` |
+| Bytes que llegan mientras se ejecuta una orden o se envía la respuesta | Los descarta. | — |
+| El `execution_controller` no contesta en 32 ciclos | Responde un error en lugar de colgarse. | `ERR_INTERNAL` |
+| Mensaje fragmentado con pausas menores a 100 ms | Lo procesa con normalidad. | La respuesta habitual |
+
+**Regla para el cliente:** tras cualquier error, esperar **al menos 150 ms** y vaciar el buffer de recepción antes de enviar el comando siguiente. Los 100 ms de silencio que exige la FPGA para volver a sincronizarse son la razón: un comando enviado antes sería descartado.
+
+### Módulos
+
+#### `protocol_defs.vh`
+
+Concentra las constantes que comparten el parser, el emisor y los testbenches, para que el código use nombres y no números: `COMMAND_*` (códigos de comando), `STATUS_*` (códigos de respuesta) y `PAYLOAD_LENGTH_*` (largo de cada respuesta OK). Sus valores coinciden con las tablas de la sección 2.
+
+#### `command_parser`
+
+**Parámetros**
+
+| Parámetro | Valor por defecto | Significado |
+| --- | --- | --- |
+| `ADDR_WIDTH` | 10 | Ancho del índice de palabra de las memorias. Fija el máximo de `LEN` (`2 + 4·1024`) y el rango válido de `GET_MEMORY`. |
+| `RX_TIMEOUT_CYCLES` | 2 700 000 | Silencio máximo dentro de un mensaje (100 ms a 27 MHz). |
+| `COMPLETION_TIMEOUT_CYCLES` | 32 | Espera máxima a que el `execution_controller` conteste. |
+
+**Interfaces**
+
+| Grupo | Señales | Descripción |
+| --- | --- | --- |
+| Entrada UART | `i_rx_byte_valid`, `i_rx_byte_data`, `i_rx_framing_error` | Salidas de `uart_rx`. `i_rx_byte_valid` es un pulso de un ciclo por cada byte recibido. |
+| Estado | `i_system_state` | Estado del sistema, para decidir `ERR_BUSY`. |
+| Órdenes | `o_run_request`, `o_step_request`, `o_reset_request` | Pulsos de un ciclo hacia `execution_controller`. |
+| Resultado | `i_command_finished`, `i_command_result` | Respuesta del `execution_controller`. |
+| Carga | `o_load_start`, `o_load_payload_length_bytes`, `o_load_byte_valid`, `o_load_byte_data` | Entradas del `program_loader`. |
+| Resultado de carga | `i_load_finished`, `i_load_error_code` | Salidas del `program_loader`. |
+| Contexto de la respuesta | `o_command_code`, `o_memory_start_word`, `o_memory_word_count` | Comando en curso y argumentos de `GET_MEMORY` ya validados. Se mantienen estables hasta el mensaje siguiente. |
+| Respuesta | `o_response_request`, `o_response_status`, `o_response_payload_length_bytes`, `i_response_finished` | Interfaz con `response_sender`. |
+
+**Máquina de estados**
+
+```mermaid
+stateDiagram-v2
+  [*] --> WAIT_COMMAND
+  WAIT_COMMAND --> RECEIVE_LENGTH_LOW: llega CMD
+  RECEIVE_LENGTH_LOW --> RECEIVE_LENGTH_HIGH: llega LEN bajo
+  RECEIVE_LENGTH_HIGH --> WAIT_RESPONSE_SENT: LEN mayor que el maximo
+  RECEIVE_LENGTH_HIGH --> FORWARD_LOAD: LOAD_PROGRAM con la CPU detenida
+  RECEIVE_LENGTH_HIGH --> EXECUTE: LEN igual a 0
+  RECEIVE_LENGTH_HIGH --> RECEIVE_PAYLOAD: LEN mayor que 0
+  RECEIVE_PAYLOAD --> EXECUTE: llegaron LEN bytes
+  FORWARD_LOAD --> WAIT_RESPONSE_SENT: el loader termino
+  EXECUTE --> WAIT_RESPONSE_SENT: rechazo o consulta
+  EXECUTE --> WAIT_COMPLETION: RUN, STEP o RESET
+  WAIT_COMPLETION --> WAIT_RESPONSE_SENT: contesta el controlador o vence el watchdog
+  WAIT_RESPONSE_SENT --> WAIT_COMMAND: respuesta enviada
+  WAIT_RESPONSE_SENT --> DISCARD_UNTIL_SILENCE: respuesta enviada tras ERR_FRAMING o LEN excesivo
+  DISCARD_UNTIL_SILENCE --> WAIT_COMMAND: 100 ms de silencio
+```
+
+Además, en `WAIT_COMMAND`, `RECEIVE_LENGTH_*` y `RECEIVE_PAYLOAD` un error de framing o 100 ms de silencio llevan directamente a `WAIT_RESPONSE_SENT` con `ERR_FRAMING` o `ERR_TIMEOUT`.
+
+**Qué hace cada estado**
+
+| Estado | Función |
+| --- | --- |
+| `WAIT_COMMAND` | Reposo. Guarda el byte `CMD` cuando llega. |
+| `RECEIVE_LENGTH_LOW` / `RECEIVE_LENGTH_HIGH` | Arman `LEN`. Al completarlo deciden el camino del mensaje. |
+| `RECEIVE_PAYLOAD` | Cuenta los bytes hasta `LEN` y guarda los primeros cuatro (los argumentos de `GET_MEMORY`). |
+| `FORWARD_LOAD` | Pasa cada byte recibido al `program_loader` y espera `i_load_finished`. No aplica timeout propio: lo hace el loader. |
+| `EXECUTE` | Con el mensaje completo, valida y despacha. |
+| `WAIT_COMPLETION` | Espera el resultado del `execution_controller`, con un watchdog de `COMPLETION_TIMEOUT_CYCLES`. |
+| `WAIT_RESPONSE_SENT` | Espera a que el emisor termine de enviar. |
+| `DISCARD_UNTIL_SILENCE` | Ignora todo hasta 100 ms de silencio. |
+
+**Detalles de diseño que conviene conocer**
+
+- **Un solo contador de silencio** sirve para el timeout dentro de un mensaje y para la resincronización: se reinicia con cada byte recibido.
+- **Un `LOAD_PROGRAM` con la CPU en `RUNNING`** no se reenvía al loader: se leen sus bytes sin usarlos y se responde `ERR_BUSY`. La decisión se toma al llegar el encabezado y no cambia aunque la ejecución termine mientras tanto.
+- **El argumento de `start + count`** se suma con 17 bits. Con 16 bits, valores como `0xFFFF + 2` desbordarían y parecerían un rango válido.
+- **Las respuestas de error nunca llevan payload**: el parser fija `LEN = 0` para todo `STATUS` distinto de `OK`.
+
+#### `response_sender`
+
+Recibe del parser un pedido de respuesta (`STATUS` y largo del payload) y la envía byte a byte: `STATUS`, `LEN` bajo, `LEN` alto y el payload.
+
+**Interfaces**
+
+| Grupo | Señales | Descripción |
+| --- | --- | --- |
+| Pedido | `i_response_request`, `i_response_status`, `i_response_payload_length_bytes` | Pulso de un ciclo. Solo se entrega con el emisor libre. |
+| Fin | `o_response_finished` | Pulso: el último byte terminó de salir, bit de stop incluido. |
+| Payload | `o_payload_byte_index`, `i_payload_byte` | El emisor pide el byte número *n* del payload y quien conoce los datos lo entrega. |
+| Transmisor | `o_tx_send_request`, `o_tx_byte_data`, `i_tx_busy` | Interfaz con `uart_tx`. |
+
+**Máquina de estados**
+
+```mermaid
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> SEND_STATUS: pedido de respuesta
+  SEND_STATUS --> SEND_LENGTH_LOW
+  SEND_LENGTH_LOW --> SEND_LENGTH_HIGH
+  SEND_LENGTH_HIGH --> SEND_PAYLOAD: LEN mayor que 0
+  SEND_LENGTH_HIGH --> WAIT_LAST_BYTE: LEN igual a 0
+  SEND_PAYLOAD --> SEND_PAYLOAD: siguiente byte
+  SEND_PAYLOAD --> WAIT_LAST_BYTE: ultimo byte pedido
+  WAIT_LAST_BYTE --> IDLE: la trama termino
+```
+
+**Por qué el payload se pide por índice.** Un pedido por índice evita colas y contadores en cada fuente de datos: la fuente es solo un selector de bytes. Funciona sin esperas porque entre un byte y el siguiente el transmisor tarda más de 2000 ciclos (un byte son 10 bits a 115200 baudios), y el emisor adelanta el índice al pedir un byte, no al necesitarlo. La fuente tiene entonces tiempo de sobra: **se le exige que entregue el byte dentro de 2 ciclos de cambiar el índice**, lo que admite una memoria con lectura registrada como el puerto B de `data_memory`.
+
+**Un detalle del transmisor.** `uart_tx` levanta `o_busy` un ciclo *después* de recibir el pedido, de modo que durante ese ciclo todavía figura libre. El emisor lo cubre considerando libre al transmisor solo si `o_busy` está bajo **y** no hay un pedido en vuelo; así no puede enviar dos veces el mismo byte.
+
+### Verificación
+
+Los testbenches usan los módulos reales del proyecto (`uart_rx`, `uart_tx`, `program_loader`, `program_memory`, `execution_controller`). Lo único simulado es la CPU (el testbench maneja `i_cpu_done`) y la fuente de payload, que devuelve un patrón conocido en lugar de datos reales.
+
+| Testbench | Qué comprueba |
+| --- | --- |
+| `tb_response_sender` | Respuestas de 0, 1, 17, 300 y 4096 bytes (`LEN` que cruza 8 bits); respuestas consecutivas; pedido con el emisor ocupado (se ignora sin alterar la trama); reset a mitad de respuesta; `o_response_finished` exactamente una vez y después del último byte. |
+| `tb_command_protocol` | 28 pruebas de extremo a extremo, desde bytes en el pin serie hasta la respuesta que recibe la PC. |
+
+Las 28 pruebas de integración cubren:
+
+- **Carga:** programa válido; encabezado inválido (`ERR_ARG`, `ERR_LEN`) conservando el programa anterior; reprogramación; `LEN` máximo exacto y máximo + 1; carga truncada.
+- **Ejecución:** `RUN`, `STEP` y `RESET` (incluido el abort desde `RUNNING`); todas las combinaciones comando × estado de la sección 2.4.
+- **Consultas:** `GET_STATUS`, `GET_REGS`, `GET_PIPELINE`; `GET_MEMORY` en los bordes del rango y con argumentos inválidos, incluidas sumas que desbordan 16 bits.
+- **Validación:** `LEN` incompatible; comando desconocido sin perder la sincronización (el payload del mensaje descartado imita un `RUN` y no debe ejecutarse).
+- **Robustez:** encabezado y payload truncados; error de framing a mitad de mensaje, en el primer byte y durante una carga; `LEN` excesivo seguido de bytes que parecen comandos; mensaje fragmentado; controlador que no contesta; reset de sistema.
+
+En cada rechazo se verifica además que **no se emitió ninguna orden, no cambió el estado del sistema y el programa cargado sigue intacto**, que es el criterio "un comando inválido no corrompe CPU ni memorias" de la US-5.2.
+
+**Resultados**
+
+| Verificación | Resultado |
+| --- | --- |
+| `tb_response_sender` | PASS |
+| `tb_command_protocol` con UART acelerada (simulación rápida) | PASS, 28 pruebas |
+| `tb_command_protocol` con los parámetros reales de la placa (27 MHz, 115200 baudios) | PASS, 28 pruebas |
+| Inyección de fallas en el RTL | 12 de 12 detectadas |
+
+Las fallas inyectadas incluyeron: suma de `GET_MEMORY` truncada, falta de resincronización tras un error, validación de estado antes que la de argumentos, ausencia de timeout en el encabezado, reenvío de `LOAD_PROGRAM` con la CPU corriendo, error de uno en el conteo del payload, falta de watchdog, framing ignorado en reposo, máximo de `LEN` exclusivo, un error con payload, y dos fallas del emisor (ignorar el pedido de transmisión en vuelo al decidir si `uart_tx` está libre, y enviar `LEN` con los bytes invertidos).
+
+**Cómo ejecutarlos** (Icarus Verilog, desde la carpeta que contiene los `.v` y `.vh`):
+
+```bash
+# Emisor
+iverilog -g2012 -I. -o sender.vvp tb_response_sender.v response_sender.v uart_tx.v uart_rx.v
+vvp sender.vvp
+
+# Integración
+iverilog -g2012 -I. -o protocol.vvp tb_command_protocol.v command_parser.v response_sender.v \
+         uart_tx.v uart_rx.v program_loader.v program_memory.v execution_controller.v
+vvp protocol.vvp
+```
+
+Cada uno imprime `PASS` o `FAIL` al final.
+
+**Recursos** (estimación con `synth_gowin` de Yosys; a confirmar con Gowin EDA en la etapa E7)
+
+| Módulo | Flip-flops | Observación |
+| --- | --- | --- |
+| `command_parser` | ≈ 142 | Dominados por el contador de silencio (22 bits), `LEN` y el conteo del payload (16 bits cada uno) y los argumentos (32 bits). |
+| `response_sender` | ≈ 56 | Índice y largo del payload (16 bits cada uno). |
+
+Ambos son lógica de control sin memorias ni multiplicadores.

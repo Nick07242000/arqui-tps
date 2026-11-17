@@ -992,3 +992,234 @@ El receptor debe leer cada bit en un instante en que la línea sea estable. Hay 
 - `o_busy` cubre la trama completa, bit de stop incluido (2340 ciclos), de modo que pedir el byte siguiente en cuanto baja no acorta el stop anterior.
 - `o_busy` sube un ciclo después de que la Debug Unit pone `i_send_request` en 1. Hay que documentarlo para quien escriba el secuenciador de respuestas (US-5.2): no consultar `o_busy` en ese ciclo intermedio y mantener `i_send_request` como un pulso de un ciclo.
 - `tb_uart_tx` verifica el caso con pedidos justo tras aceptar, a mitad de trama y en el último ciclo con `o_busy` en 1.
+
+## ADR - Parser y emisor de respuestas como módulos propios
+
+### Contexto
+
+La arquitectura (§1.1) describe una única `debug_unit` con "parser + FSM de sistema + secuenciador de respuestas". La FSM de sistema ya existe como `execution_controller` y la carga como `program_loader`. Falta decidir cómo se materializan el parser de mensajes y el secuenciador de respuestas.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Un único módulo `debug_unit` con el parser, el emisor y el cableado de todas las acciones. |
+| **A** | **Dos módulos: `command_parser` (recibe, valida y ordena) y `response_sender` (serializa la respuesta).** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- El parser se prueba con la UART, el loader y el controlador reales sin esperar a la US-5.3; el emisor se prueba solo, con un monitor de PC.
+- Es el mismo criterio que ya se aplicó a `program_loader` y `execution_controller`: la Debug Unit queda como el lugar donde se conectan las piezas, no donde se mezcla toda la lógica.
+- Cada módulo tiene una única responsabilidad: uno decide *qué* responder, el otro *cómo* enviarlo.
+
+### Consecuencias
+
+- La US-5.3 instancia los dos módulos y los cablea con `program_loader`, `execution_controller` y `uart_rx/uart_tx`.
+- `command_parser` y `response_sender` no figuran en la tabla de módulos del documento de arquitectura (§1.1) y conviene agregarlos.
+
+## ADR - Payload de la respuesta pedido por índice
+
+### Contexto
+
+Las respuestas `OK` de las consultas tienen payloads de naturaleza distinta: 17 bytes de estado, 128 de registros, 73 de latches y hasta 4096 de memoria. El emisor necesita obtener esos bytes de fuentes con latencias diferentes (registros combinacionales, memoria con lectura registrada).
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Cada fuente entrega un flujo de bytes con handshake `valid/ready`, con su propio secuenciador. |
+| **A** | **El emisor pide el byte número *n* mediante un índice; la fuente es un selector de bytes.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Las fuentes quedan como multiplexores sin contadores ni estados: toda la secuenciación vive en un solo lugar.
+- No hace falta handshake: el transmisor tarda más de 2000 ciclos por byte y el emisor adelanta el índice al pedir un byte, no al necesitarlo, de modo que la fuente tiene tiempo de sobra.
+- Es compatible con el puerto B de `data_memory`, que devuelve el dato con un ciclo de latencia.
+
+### Consecuencias
+
+- Contrato con la fuente: debe entregar `i_payload_byte` dentro de los 2 ciclos posteriores a un cambio de `o_payload_byte_index`.
+- La fuente conoce el comando por `o_command_code`, que el parser mantiene estable durante toda la respuesta.
+- Un índice de 16 bits cubre el payload máximo (4096 bytes).
+
+## ADR - El parser consume el mensaje completo antes de responder
+
+### Contexto
+
+Un mensaje puede ser inválido por su comando, su longitud, sus argumentos o el estado del sistema. Hay que decidir cuándo se responde y qué se hace con los bytes que todavía no llegaron.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Responder el error en cuanto se detecta y descartar el resto. |
+| **A** | **Leer los `LEN` bytes completos, validar y recién entonces responder. Solo `LEN` mayor que el máximo se responde de inmediato.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Un comando inválido no deja bytes sueltos: el payload de un mensaje rechazado no puede interpretarse como un comando nuevo (la prueba lo verifica con un payload que imita un `RUN`).
+- La respuesta marca el final del intercambio: cuando la PC la recibe, el flujo está sincronizado.
+- Cuando `LEN` es mayor que el máximo ya no se puede confiar en el tamaño declarado, por lo que ahí se descarta hasta un silencio.
+- `LOAD_PROGRAM` no se bufferiza: el parser reenvía cada byte al `program_loader`, que ya valida y escribe, y solo espera su veredicto.
+
+### Consecuencias
+
+- Un `LOAD_PROGRAM` rechazado con `ERR_BUSY` tarda hasta 0,36 s en responder (lee los 4101 bytes antes).
+- Un `LOAD_PROGRAM` con la CPU en `RUNNING` se decide al llegar el encabezado, aunque la ejecución termine mientras llega el payload.
+- El parser valida `LEN` y argumentos de los comandos con payload corto; el `LEN` y `N_WORDS` de `LOAD_PROGRAM` los valida el `program_loader`.
+
+## ADR - Timeout de 100 ms también durante `CMD` y `LEN`
+
+### Contexto
+
+El diagrama del parser en la arquitectura (§8.3) solo aplica el timeout de 100 ms mientras se recibe el payload. Si el mensaje se corta después de `CMD` o de `LEN`, el parser quedaría esperando indefinidamente y el siguiente comando de la PC se interpretaría como parte del anterior.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Timeout solo en el payload, como en el diagrama original. |
+| **A** | **Timeout en cualquier punto entre la llegada de `CMD` y la del último byte del mensaje.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Cubre el criterio "datos insuficientes" de la tarea T5.2.2 en todos los puntos del mensaje, no solo en el payload.
+- Reutiliza el mismo contador de silencio que la resincronización.
+- Un mensaje cortado en el encabezado ya no puede desincronizar el flujo.
+
+### Consecuencias
+
+- El parser en reposo, antes de recibir `CMD`, no tiene límite de espera.
+- Hay que actualizar el diagrama de la arquitectura (§8.3).
+- Durante `LOAD_PROGRAM` el timeout lo aplica el `program_loader`; el parser no agrega uno propio, para que ambos no compitan.
+
+## ADR - Error de framing: respuesta y resincronización por silencio
+
+### Contexto
+
+La arquitectura (§8.1) indica que un error de framing aborta el mensaje en curso con `ERR_FRAMING`. Tras un framing error se pierde un byte y no hay forma de saber dónde empieza el siguiente mensaje: sin checksum, los bytes restantes de un mensaje roto podrían parecer un comando válido.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Responder `ERR_FRAMING` y volver a esperar un `CMD` de inmediato. |
+| **A** | **Responder `ERR_FRAMING` e ignorar todo byte hasta 100 ms de silencio.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Es la misma regla que ya aplica el cliente (esperar al menos 150 ms tras un error y vaciar el buffer): ambos lados coinciden en la ventana de silencio.
+- Evita que el resto de un mensaje roto se ejecute como comando. La prueba envía justo después de un framing error los bytes de un `RUN` y verifica que no se ejecuta.
+- El mismo mecanismo sirve para `LEN` mayor que el máximo.
+
+### Consecuencias
+
+- Un comando enviado antes de que pasen los 100 ms de silencio se descarta; el cliente debe esperar ≥ 150 ms.
+- El framing error se trata igual en reposo (el primer byte del pedido se perdió) que a mitad de un mensaje.
+- Durante `LOAD_PROGRAM` el parser no reacciona al framing error: el byte perdido hace que la carga no se complete y la detecta el timeout del `program_loader` (`ERR_TIMEOUT`, sistema en `EMPTY`). El resultado es seguro, pero se informa como `ERR_TIMEOUT` y no como `ERR_FRAMING`. Lo cubre la prueba "Framing error durante LOAD_PROGRAM".
+
+## ADR - `LEN` excesivo se informa antes que un comando desconocido
+
+### Contexto
+
+Un mensaje puede tener a la vez un comando inexistente y un `LEN` mayor que el máximo. Hay que elegir cuál se informa.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Validar primero el comando y responder `ERR_CMD`. |
+| **A** | **Validar primero el `LEN` máximo y responder `ERR_LEN`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- El `LEN` máximo es una condición de la trama, no del comando: decide cómo se consume el resto de los bytes (descartar hasta un silencio en lugar de leer `LEN` bytes). Hay que resolverlo antes de mirar qué comando es.
+- Coincide con la regla 2 del parser de la arquitectura (§8.3).
+
+### Consecuencias
+
+- El orden de validación documentado es: `LEN` máximo, comando, `LEN` del comando, argumentos, estado.
+- Un comando desconocido con `LEN` razonable se informa como `ERR_CMD`, consumiendo su payload.
+
+## ADR - Watchdog sobre la respuesta del `execution_controller`
+
+### Contexto
+
+Tras ordenar `RUN`, `STEP` o `RESET`, el parser espera `o_command_finished`. El controlador responde en 1 a 3 ciclos, pero si por un error de integración no respondiera, el parser quedaría bloqueado y la UART dejaría de atender comandos. El roadmap (T5.2.2) pide una respuesta explícita para el caso de error interno.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Esperar indefinidamente, confiando en el controlador. |
+| **A** | **Un contador de 32 ciclos (`COMPLETION_TIMEOUT_CYCLES`) que, al vencer, responde `ERR_INTERNAL`.** |
+
+### Decisión
+
+**Opción A.**
+
+### Motivos
+
+- Es el único caso de "error interno" del protocolo que puede detectarse y probarse sin inyectar fallas en el controlador.
+- Cuesta un contador de 6 bits y garantiza que el protocolo nunca se cuelga: el cliente recibe un error y puede enviar `RESET`.
+- La espera de la carga no necesita watchdog: está acotada por el timeout del `program_loader`.
+
+### Consecuencias
+
+- La prueba desconecta `o_command_finished` del parser y verifica `ERR_INTERNAL` y que el protocolo sigue operativo.
+- Si el controlador cambia a respuestas más lentas, hay que ajustar `COMPLETION_TIMEOUT_CYCLES`.
+- El controlador pudo haber ejecutado el comando aunque el parser informe `ERR_INTERNAL`; por eso el cliente debe consultar `GET_STATUS` antes de reintentar.
+
+## ADR - Argumentos de `GET_MEMORY` en un registro de desplazamiento
+
+### Contexto
+
+El parser guarda los primeros 4 bytes del payload (`start_word` y `count`). La primera versión escribía el byte en su posición con un corte dinámico (`argument_bytes[8*indice +: 8] <= dato`). Al sintetizar con `synth_gowin` de Yosys el módulo resultó desproporcionado para una máquina de estados de este tamaño.
+
+### Alternativas
+
+| Opción | Descripción |
+| --- | --- |
+| 0 | Escritura con corte dinámico `+:`. |
+| A | `case` sobre los 2 bits del índice, un registro por byte. |
+| **B** | **Registro de desplazamiento: cada byte entra por arriba y, con 4 bytes, el primero queda en los bits bajos.** |
+
+### Decisión
+
+**Opción B.**
+
+### Motivos
+
+- Con la opción 0 la multiplicación `8*índice` se evalúa con ancho de 32 bits y el desplazamiento dinámico se expande en un desplazador completo. Medido con Yosys: ≈ 2100 celdas contra ≈ 750 con la opción B.
+- La opción B es el mismo patrón que ya usa `program_loader` para armar palabras de 32 bits.
+- La opción A baja el costo igual, pero es más extensa.
+
+### Consecuencias
+
+- Los argumentos solo quedan alineados si el payload tiene exactamente 4 bytes. Es el único caso en que se usan (`GET_MEMORY`); con otro `LEN` el mensaje se rechaza con `ERR_LEN` antes de mirarlos.
+- Las cifras son estimaciones de Yosys y deben confirmarse con Gowin EDA en la etapa E7.
+- La decodificación del comando con un `wire` por comando (`command_is_run`, `command_is_get_memory`, …) se adoptó por legibilidad; no modificó el recurso utilizado.

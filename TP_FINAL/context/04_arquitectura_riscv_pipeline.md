@@ -57,7 +57,9 @@ soc_top                      # clk, rst_btn_n, uart_rx_pin, uart_tx_pin, led[5:0
 ├── reset_sync               # sincroniza el reset externo (power-on + botón)
 ├── uart_rx                  # bytes <- pin
 ├── uart_tx                  # bytes -> pin
-├── debug_unit               # parser + FSM de sistema + secuenciador de respuestas
+├── debug_unit               # FSM de sistema principal
+│   ├── command_parser       # recepción, validación, timeout (en LEN y PAYLOAD) y framing
+│   └── response_sender      # secuenciador y emisor de respuestas / errores
 ├── program_loader           # recepción y escritura de programa en imem (colabora con debug_unit)
 ├── execution_controller     # control de RUN/STEP/RESET, cpu_en y parte RESET de cpu_rst (colabora con debug_unit)
 ├── program_memory           # 1024x32, escritura DU / lectura CPU
@@ -663,7 +665,7 @@ Enteros multibyte en **little-endian**. Sin checksum ni versionado (decisión de
 | `0x06` | `ERR_NO_PROGRAM` | `RUN`/`STEP` sin programa válido |
 | `0x07` | `ERR_TIMEOUT` | Mensaje incompleto (p. ej. carga truncada) |
 | `0x08` | `ERR_FRAMING` | Error de framing UART |
-| `0x09` | `ERR_INTERNAL` | Estado inconsistente / no esperado |
+| `0x09` | `ERR_INTERNAL` | Estado inconsistente / no esperado o el `execution_controller` no contesta dentro de `COMPLETION_TIMEOUT_CYCLES` |
 
 En una respuesta de error `LEN = 0`.
 
@@ -687,18 +689,26 @@ CPI ≈ `cycles / retired`.
 stateDiagram-v2
   [*] --> WAIT_CMD
   WAIT_CMD --> LEN_L: byte CMD
+  WAIT_CMD --> RESP_ERR_TIMEOUT: sin bytes 100 ms
+  WAIT_CMD --> RESP_ERR_FRAMING: rx_ferr
   LEN_L --> LEN_H: byte
+  LEN_L --> RESP_ERR_TIMEOUT: sin bytes 100 ms
+  LEN_L --> RESP_ERR_FRAMING: rx_ferr
   LEN_H --> PAYLOAD: LEN valido y mayor que 0
   LEN_H --> EXEC: LEN igual 0
   LEN_H --> RESP_ERR_DISCARD: LEN mayor que MAX_LEN
+  LEN_H --> RESP_ERR_TIMEOUT: sin bytes 100 ms
+  LEN_H --> RESP_ERR_FRAMING: rx_ferr
   PAYLOAD --> PAYLOAD: byte
   PAYLOAD --> EXEC: recibidos LEN bytes
   PAYLOAD --> RESP_ERR_TIMEOUT: sin bytes 100 ms
+  PAYLOAD --> RESP_ERR_FRAMING: rx_ferr
   EXEC --> RESPOND: valida y ejecuta
   RESPOND --> WAIT_CMD: respuesta enviada
   RESP_ERR_DISCARD --> DISCARD: envia ERR_LEN
-  DISCARD --> WAIT_CMD: silencio 100 ms
+  RESP_ERR_FRAMING --> DISCARD: envia ERR_FRAMING
   RESP_ERR_TIMEOUT --> WAIT_CMD: envia ERR_TIMEOUT
+  DISCARD --> WAIT_CMD: silencio 100 ms
 ```
 
 Reglas:
